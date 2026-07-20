@@ -1,0 +1,32 @@
+{
+  "name": "ssbpsychbigb-backend",
+  "version": "1.0.0",
+  "description": "SSBPsychBigB API — Node.js, Express, MongoDB",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "express",
+    "mongodb",
+    "mongoose",
+    "api"
+  ],
+  "license": "UNLICENSED",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "mongoose": "^9.7.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}
