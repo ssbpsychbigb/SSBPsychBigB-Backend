@@ -48,6 +48,22 @@ const config = Object.freeze({
   // * Google + Cloudflare — used only by this Node process for Atlas SRV lookups.
   // * Set DNS_SERVERS= in .env to disable and use the OS resolver.
   dnsServers: parseList(process.env.DNS_SERVERS ?? '8.8.8.8,1.1.1.1'),
+  jwt: Object.freeze({
+    // * Dev default is intentional for local start — replace in production.
+    secret: required(
+      'JWT_SECRET',
+      'dev-only-change-me-ssbpsychbigb-jwt-secret',
+    ),
+    expiresIn: required('JWT_EXPIRES_IN', '7d'),
+  }),
+  otp: Object.freeze({
+    length: Number(required('OTP_LENGTH', '6')),
+    ttlSeconds: Number(required('OTP_TTL_SECONDS', '300')),
+  }),
+  upload: Object.freeze({
+    dir: required('UPLOAD_DIR', 'uploads'),
+    maxFileBytes: Number(required('UPLOAD_MAX_BYTES', String(5 * 1024 * 1024))),
+  }),
 });
 
 module.exports = config;

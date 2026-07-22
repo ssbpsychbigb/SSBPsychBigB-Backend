@@ -14,7 +14,13 @@
  */
 
 const { healthRouter } = require('./health/health.routes');
+const { authRouter } = require('./auth/auth.routes');
+const { adminAuthRouter } = require('./admin-auth/admin-auth.routes');
+const { adminApprovalsRouter } = require('./admin-approvals/admin-approvals.routes');
 
 module.exports = {
   healthRouter,
+  authRouter,
+  adminAuthRouter,
+  adminApprovalsRouter,
 };

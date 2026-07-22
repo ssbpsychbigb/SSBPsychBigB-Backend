@@ -27,5 +27,8 @@ dist/
 build/
 .nyc_output/
 
+# Local file uploads (auth registration assets)
+uploads/
+
 # Optional local overrides
 *.local.js
