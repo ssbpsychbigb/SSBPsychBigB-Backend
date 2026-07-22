@@ -44,6 +44,19 @@ function createApp() {
     });
   });
 
+  // * Lightweight wake / uptime probe — no DB. Used by admin Wake button + monitors.
+  app.get('/health', (_req, res) => {
+    res.status(200).json({
+      success: true,
+      message: 'OK',
+      data: {
+        status: 'up',
+        env: config.env,
+        timestamp: new Date().toISOString(),
+      },
+    });
+  });
+
   app.use(config.apiPrefix, apiRouter);
 
   app.use(notFoundHandler);
