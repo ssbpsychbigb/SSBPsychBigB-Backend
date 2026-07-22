@@ -31,6 +31,7 @@ const adminUserSchema = new mongoose.Schema(
     email: {
       type: String,
       required: true,
+      unique: true,
       trim: true,
       lowercase: true,
     },
@@ -38,6 +39,15 @@ const adminUserSchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
+    },
+    mobileNumber: {
+      type: String,
+      trim: true,
+      // * Sparse unique — Super Admin seed may omit until set; staff create requires it.
+      unique: true,
+      sparse: true,
+      minlength: 10,
+      maxlength: 10,
     },
     role: {
       type: String,

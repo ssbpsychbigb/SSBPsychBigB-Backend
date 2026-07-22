@@ -11,15 +11,20 @@ const { adminApprovalsService } = require('./admin-approvals.service');
 class AdminApprovalsController {
   /**
    * GET /admin/approvals/pending
+   * Query: type, status=pending|rejected
    */
   listPending = asyncHandler(async (req, res) => {
-    const data = await adminApprovalsService.listPending({
+    const data = await adminApprovalsService.list({
       type: req.query.type,
+      status: req.query.status,
     });
 
     return ApiResponse.success(res, {
       statusCode: HTTP_STATUS.OK,
-      message: 'Pending approvals',
+      message:
+        req.query.status === 'rejected'
+          ? 'Rejected applications'
+          : 'Pending approvals',
       data,
     });
   });
@@ -48,6 +53,7 @@ class AdminApprovalsController {
       userId: req.params.userId,
       admin: req.admin,
       reason: req.body.reason,
+      rejectedFields: req.body.rejectedFields,
     });
 
     return ApiResponse.success(res, {

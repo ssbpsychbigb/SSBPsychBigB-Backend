@@ -8,6 +8,7 @@ const { AdminUser } = require('./admin-user.model');
 const {
   ACCOUNT_STATUS,
   PORTAL,
+  ADMIN_ROLES,
   ROLE_DEFAULT_PERMISSIONS,
 } = require('../auth/auth.constants');
 
@@ -21,6 +22,7 @@ function toPublicAdmin(adminDoc) {
     loginId: json.loginId,
     email: json.email,
     fullName: json.fullName,
+    mobileNumber: json.mobileNumber || undefined,
     role: json.role,
     accountStatus: json.accountStatus,
     portal: json.portal,
@@ -35,28 +37,33 @@ function toPublicAdmin(adminDoc) {
  */
 class AdminAuthService {
   /**
-   * @param {{ loginId: string, password: string }} input
+   * @param {{ loginId?: string, email?: string, identifier?: string, password: string }} input
    */
-  async login({ loginId, password }) {
-    const normalizedId = String(loginId || '')
+  async login({ loginId, email, identifier, password }) {
+    const normalizedId = String(identifier || loginId || email || '')
       .trim()
       .toLowerCase();
     const rawPassword = String(password || '');
 
     if (!normalizedId || !rawPassword) {
-      throw new AppError('Login ID and password are required.', HTTP_STATUS.BAD_REQUEST, {
-        code: 'INVALID_CREDENTIALS_INPUT',
-      });
+      throw new AppError(
+        'Login ID or email, and password are required.',
+        HTTP_STATUS.BAD_REQUEST,
+        { code: 'INVALID_CREDENTIALS_INPUT' },
+      );
     }
 
-    const admin = await AdminUser.findOne({ loginId: normalizedId }).select(
-      '+passwordHash',
-    );
+    // * Operators may sign in with either loginId or email.
+    const admin = await AdminUser.findOne({
+      $or: [{ loginId: normalizedId }, { email: normalizedId }],
+    }).select('+passwordHash');
 
     if (!admin) {
-      throw new AppError('Invalid login ID or password.', HTTP_STATUS.UNAUTHORIZED, {
-        code: 'INVALID_CREDENTIALS',
-      });
+      throw new AppError(
+        'Invalid login ID, email, or password.',
+        HTTP_STATUS.UNAUTHORIZED,
+        { code: 'INVALID_CREDENTIALS' },
+      );
     }
 
     if (admin.accountStatus !== ACCOUNT_STATUS.ACTIVE) {
@@ -68,14 +75,18 @@ class AdminAuthService {
 
     const isMatch = await bcrypt.compare(rawPassword, admin.passwordHash);
     if (!isMatch) {
-      throw new AppError('Invalid login ID or password.', HTTP_STATUS.UNAUTHORIZED, {
-        code: 'INVALID_CREDENTIALS',
-      });
+      throw new AppError(
+        'Invalid login ID, email, or password.',
+        HTTP_STATUS.UNAUTHORIZED,
+        { code: 'INVALID_CREDENTIALS' },
+      );
     }
 
-    // * Backfill default permissions when role catalog expands.
+    // * Keep permission grants in sync with role catalog (especially Super Admin = all).
     const defaults = ROLE_DEFAULT_PERMISSIONS[admin.role] || [];
-    if (!admin.permissions?.length && defaults.length) {
+    if (admin.role === ADMIN_ROLES.SUPER_ADMIN) {
+      admin.permissions = [...defaults];
+    } else if (!admin.permissions?.length && defaults.length) {
       admin.permissions = [...defaults];
     }
 
@@ -106,6 +117,20 @@ class AdminAuthService {
       throw new AppError('Admin not found.', HTTP_STATUS.NOT_FOUND, {
         code: 'ADMIN_NOT_FOUND',
       });
+    }
+
+    // * Super Admin always carries the full permission catalog.
+    if (admin.role === ADMIN_ROLES.SUPER_ADMIN) {
+      const defaults = ROLE_DEFAULT_PERMISSIONS[ADMIN_ROLES.SUPER_ADMIN] || [];
+      const current = admin.permissions || [];
+      const same =
+        current.length === defaults.length &&
+        defaults.every((code) => current.includes(code));
+
+      if (!same) {
+        admin.permissions = [...defaults];
+        await admin.save();
+      }
     }
 
     return toPublicAdmin(admin);

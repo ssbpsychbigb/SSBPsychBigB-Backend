@@ -63,6 +63,13 @@ const registerUpload = multer({
   { name: 'officerIdDocument', maxCount: 1 },
 ]);
 
+/** Optional profile photo for institute team invites / updates. */
+const teamProfileUpload = multer({
+  storage,
+  fileFilter,
+  limits: { fileSize: config.upload.maxFileBytes, files: 1 },
+}).fields([{ name: 'profilePhoto', maxCount: 1 }]);
+
 /**
  * Relative public path for a stored upload (served under /uploads).
  * @param {Express.Multer.File | undefined} file
@@ -76,4 +83,9 @@ function toPublicUploadPath(file) {
   return `/uploads/${file.filename}`;
 }
 
-module.exports = { registerUpload, toPublicUploadPath, uploadRoot };
+module.exports = {
+  registerUpload,
+  teamProfileUpload,
+  toPublicUploadPath,
+  uploadRoot,
+};

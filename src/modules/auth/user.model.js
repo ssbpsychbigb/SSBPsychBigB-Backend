@@ -8,7 +8,8 @@ const {
 } = require('./auth.constants');
 
 /**
- * App-portal user account (aspirant / institute / defence officer).
+ * App-portal user account.
+ * Institute team (admin / educator) are invite-only and scoped via instituteId.
  * Admin operators live in AdminUser — portals stay isolated.
  */
 const userSchema = new mongoose.Schema(
@@ -67,6 +68,15 @@ const userSchema = new mongoose.Schema(
       trim: true,
       default: '',
     },
+    /** Exams an educator prepares students for (multi-select). */
+    examGoals: {
+      type: [String],
+      default: [],
+    },
+    profilePhotoPath: {
+      type: String,
+      default: '',
+    },
     instituteName: {
       type: String,
       trim: true,
@@ -84,6 +94,22 @@ const userSchema = new mongoose.Schema(
       type: String,
       default: '',
     },
+    /**
+     * Owner User id for institute-scoped members (institute_admin / educator).
+     * Null for aspirants, defence officers, and institute owners themselves.
+     */
+    instituteId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+      index: true,
+    },
+    /** App user who invited this member (owner or institute admin). */
+    invitedByUserId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
     permissions: {
       type: [String],
       default: [],
@@ -92,6 +118,30 @@ const userSchema = new mongoose.Schema(
       type: String,
       default: '',
       trim: true,
+    },
+    /** Field codes from REJECTION_FIELDS_BY_ROLE that failed review. */
+    rejectedFields: {
+      type: [String],
+      default: [],
+    },
+    /** Snapshot of the last rejection kept after applicant resubmits. */
+    previousRejectionReason: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    previousRejectedFields: {
+      type: [String],
+      default: [],
+    },
+    resubmittedAt: {
+      type: Date,
+      default: null,
+    },
+    resubmissionCount: {
+      type: Number,
+      default: 0,
+      min: 0,
     },
     reviewedAt: {
       type: Date,
@@ -122,6 +172,7 @@ const userSchema = new mongoose.Schema(
 userSchema.index({ email: 1 });
 userSchema.index({ role: 1, accountStatus: 1 });
 userSchema.index({ isMobileVerified: 1 });
+userSchema.index({ instituteId: 1, role: 1, accountStatus: 1 });
 
 const User = mongoose.model('User', userSchema);
 

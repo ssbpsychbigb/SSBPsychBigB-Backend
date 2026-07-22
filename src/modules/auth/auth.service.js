@@ -21,6 +21,8 @@ const {
   JOIN_TYPE_TO_ROLE,
   PENDING_ON_REGISTER_ROLES,
   APP_ROLES,
+  VERIFICATION_LEVEL_ON_INVITE_ACTIVATE,
+  REJECTION_FIELDS_BY_ROLE,
 } = require('./auth.constants');
 const { toPublicUploadPath } = require('./auth.upload');
 
@@ -29,6 +31,52 @@ const BLOCKED_LOGIN_STATUSES = new Set([
   ACCOUNT_STATUS.BANNED,
   ACCOUNT_STATUS.DELETED,
 ]);
+
+/**
+ * Clear, user-facing copy when login is refused due to account status.
+ * @param {string} accountStatus
+ * @returns {{ message: string, title: string }}
+ */
+function getBlockedLoginCopy(accountStatus) {
+  if (accountStatus === ACCOUNT_STATUS.SUSPENDED) {
+    return {
+      title: 'Account suspended',
+      message:
+        'Your account is temporarily suspended by a platform admin. You cannot sign in or receive OTP until an admin reactivates your account.',
+    };
+  }
+
+  if (accountStatus === ACCOUNT_STATUS.BANNED) {
+    return {
+      title: 'Account banned',
+      message:
+        'Your account has been banned for a policy violation. You cannot sign in until a platform admin restores access.',
+    };
+  }
+
+  return {
+    title: 'Account unavailable',
+    message:
+      'This account has been removed and can no longer be used to sign in. Register again if you need a new account.',
+  };
+}
+
+/**
+ * Throws a forbidden error for blocked account statuses.
+ * @param {string} accountStatus
+ */
+function assertAccountCanLogin(accountStatus) {
+  if (!BLOCKED_LOGIN_STATUSES.has(accountStatus)) {
+    return;
+  }
+
+  const { title, message } = getBlockedLoginCopy(accountStatus);
+
+  throw new AppError(message, HTTP_STATUS.FORBIDDEN, {
+    code: 'ACCOUNT_BLOCKED',
+    details: { accountStatus, title },
+  });
+}
 
 /**
  * Maps a mongoose user document to a safe API shape.
@@ -47,11 +95,26 @@ function toPublicUser(userDoc) {
     portal: json.portal,
     verificationLevel: json.verificationLevel,
     examGoal: json.examGoal || undefined,
+    examGoals: Array.isArray(json.examGoals) ? json.examGoals : [],
+    profilePhotoPath: json.profilePhotoPath || undefined,
     instituteName: json.instituteName || undefined,
     instituteLogoPath: json.instituteLogoPath || undefined,
     officerPhotoPath: json.officerPhotoPath || undefined,
     officerIdDocumentPath: json.officerIdDocumentPath || undefined,
     rejectionReason: json.rejectionReason || undefined,
+    rejectedFields: Array.isArray(json.rejectedFields)
+      ? json.rejectedFields
+      : [],
+    previousRejectionReason: json.previousRejectionReason || undefined,
+    previousRejectedFields: Array.isArray(json.previousRejectedFields)
+      ? json.previousRejectedFields
+      : [],
+    resubmittedAt: json.resubmittedAt || undefined,
+    resubmissionCount: Number(json.resubmissionCount) || 0,
+    instituteId: json.instituteId ? String(json.instituteId) : undefined,
+    invitedByUserId: json.invitedByUserId
+      ? String(json.invitedByUserId)
+      : undefined,
     permissions: json.permissions || [],
     createdAt: json.createdAt,
     lastLoginAt: json.lastLoginAt,
@@ -274,13 +337,7 @@ class AuthService {
       );
     }
 
-    if (BLOCKED_LOGIN_STATUSES.has(user.accountStatus)) {
-      throw new AppError(
-        'This account cannot sign in right now. Contact support.',
-        HTTP_STATUS.FORBIDDEN,
-        { code: 'ACCOUNT_BLOCKED', details: { accountStatus: user.accountStatus } },
-      );
-    }
+    assertAccountCanLogin(user.accountStatus);
 
     return issueOtpChallenge({
       mobileNumber,
@@ -390,6 +447,188 @@ class AuthService {
       });
     }
 
+    assertAccountCanLogin(user.accountStatus);
+
+    const publicUser = toPublicUser(user);
+
+    // * Team members inherit institute branding from the owner account.
+    if (user.instituteId && !publicUser.instituteLogoPath) {
+      const owner = await User.findById(user.instituteId).select(
+        'instituteLogoPath instituteName',
+      );
+      if (owner) {
+        if (owner.instituteLogoPath) {
+          publicUser.instituteLogoPath = owner.instituteLogoPath;
+        }
+        if (!publicUser.instituteName && owner.instituteName) {
+          publicUser.instituteName = owner.instituteName;
+        }
+      }
+    }
+
+    return publicUser;
+  }
+
+  /**
+   * Rejected institute / officer applicants fix flagged fields and re-enter the queue.
+   * @param {{
+   *   userId: string,
+   *   body: Record<string, string>,
+   *   files?: Record<string, Express.Multer.File[]>,
+   * }} input
+   */
+  async resubmitApplication({ userId, body, files = {} }) {
+    const user = await User.findById(userId);
+
+    if (!user || user.accountStatus === ACCOUNT_STATUS.DELETED) {
+      throw new AppError('User not found.', HTTP_STATUS.NOT_FOUND, {
+        code: 'USER_NOT_FOUND',
+      });
+    }
+
+    if (
+      user.role !== APP_ROLES.INSTITUTE &&
+      user.role !== APP_ROLES.DEFENCE_OFFICER
+    ) {
+      throw new AppError(
+        'Only institute and defence officer applications can be resubmitted.',
+        HTTP_STATUS.BAD_REQUEST,
+        { code: 'NOT_RESUBMIT_CANDIDATE' },
+      );
+    }
+
+    if (user.accountStatus !== ACCOUNT_STATUS.REJECTED) {
+      throw new AppError(
+        'Only rejected applications can be fixed and resubmitted.',
+        HTTP_STATUS.CONFLICT,
+        { code: 'APPLICATION_NOT_REJECTED' },
+      );
+    }
+
+    const flaggedRaw = Array.isArray(user.rejectedFields)
+      ? user.rejectedFields
+      : [];
+    const roleDefaults = REJECTION_FIELDS_BY_ROLE[user.role] || [];
+    const flagged =
+      flaggedRaw.length > 0 ? flaggedRaw : [...roleDefaults];
+
+    if (flagged.length === 0) {
+      throw new AppError(
+        'No fields were flagged for correction. Contact support.',
+        HTTP_STATUS.BAD_REQUEST,
+        { code: 'NO_REJECTED_FIELDS' },
+      );
+    }
+
+    const flaggedSet = new Set(flagged);
+
+    if (flaggedSet.has('fullName')) {
+      const fullName = String(body.fullName || '').trim();
+      if (fullName.length < 2) {
+        throw new AppError('Full name is required.', HTTP_STATUS.BAD_REQUEST, {
+          code: 'INVALID_FULL_NAME',
+        });
+      }
+      user.fullName = fullName;
+    }
+
+    if (flaggedSet.has('email')) {
+      const email = String(body.email || '')
+        .trim()
+        .toLowerCase();
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        throw new AppError('Enter a valid email address.', HTTP_STATUS.BAD_REQUEST, {
+          code: 'INVALID_EMAIL',
+        });
+      }
+      user.email = email;
+    }
+
+    if (flaggedSet.has('mobileNumber')) {
+      const mobileNumber = normalizeMobile(body.mobileNumber);
+      if (!isValidIndianMobile(mobileNumber)) {
+        throw new AppError(
+          'Enter a valid 10-digit Indian mobile number.',
+          HTTP_STATUS.BAD_REQUEST,
+          { code: 'INVALID_MOBILE' },
+        );
+      }
+
+      if (mobileNumber !== user.mobileNumber) {
+        const taken = await User.findOne({
+          mobileNumber,
+          _id: { $ne: user._id },
+        });
+        if (taken) {
+          throw new AppError(
+            'This mobile number is already registered.',
+            HTTP_STATUS.CONFLICT,
+            { code: 'MOBILE_ALREADY_REGISTERED' },
+          );
+        }
+        user.mobileNumber = mobileNumber;
+      }
+    }
+
+    if (flaggedSet.has('instituteName')) {
+      const instituteName = String(body.instituteName || '').trim();
+      if (instituteName.length < 2) {
+        throw new AppError('Institute name is required.', HTTP_STATUS.BAD_REQUEST, {
+          code: 'INVALID_INSTITUTE_NAME',
+        });
+      }
+      user.instituteName = instituteName;
+      user.fullName = instituteName;
+    }
+
+    if (flaggedSet.has('instituteLogo')) {
+      const logo = files.instituteLogo?.[0];
+      if (!logo) {
+        throw new AppError(
+          'Please upload a new institute logo.',
+          HTTP_STATUS.BAD_REQUEST,
+          { code: 'MISSING_INSTITUTE_LOGO' },
+        );
+      }
+      user.instituteLogoPath = toPublicUploadPath(logo);
+    }
+
+    if (flaggedSet.has('officerPhoto')) {
+      const photo = files.officerPhoto?.[0];
+      if (!photo) {
+        throw new AppError(
+          'Please upload a new officer photo.',
+          HTTP_STATUS.BAD_REQUEST,
+          { code: 'MISSING_OFFICER_PHOTO' },
+        );
+      }
+      user.officerPhotoPath = toPublicUploadPath(photo);
+    }
+
+    if (flaggedSet.has('officerIdDocument')) {
+      const idDoc = files.officerIdDocument?.[0];
+      if (!idDoc) {
+        throw new AppError(
+          'Please upload a new ID document.',
+          HTTP_STATUS.BAD_REQUEST,
+          { code: 'MISSING_OFFICER_ID' },
+        );
+      }
+      user.officerIdDocumentPath = toPublicUploadPath(idDoc);
+    }
+
+    user.accountStatus = ACCOUNT_STATUS.PENDING_VERIFICATION;
+    // * Keep last rejection as context for admin + applicant while pending again.
+    user.previousRejectionReason = String(user.rejectionReason || '').trim();
+    user.previousRejectedFields = [...flagged];
+    user.resubmittedAt = new Date();
+    user.resubmissionCount = Math.max(0, Number(user.resubmissionCount) || 0) + 1;
+    user.rejectionReason = '';
+    user.rejectedFields = [];
+    user.reviewedAt = null;
+    user.reviewedByAdminId = null;
+    await user.save();
+
     return toPublicUser(user);
   }
 
@@ -408,24 +647,49 @@ class AuthService {
       );
     }
 
-    if (BLOCKED_LOGIN_STATUSES.has(user.accountStatus)) {
-      throw new AppError(
-        'This account cannot sign in right now. Contact support.',
-        HTTP_STATUS.FORBIDDEN,
-        { code: 'ACCOUNT_BLOCKED' },
-      );
-    }
+    assertAccountCanLogin(user.accountStatus);
 
     if (!user.isMobileVerified) {
       user.isMobileVerified = true;
       user.mobileVerifiedAt = new Date();
     }
 
+    // * Invited institute team activates on first successful OTP login.
+    if (user.accountStatus === ACCOUNT_STATUS.INVITED) {
+      user.accountStatus = ACCOUNT_STATUS.ACTIVE;
+      const inviteLevel = VERIFICATION_LEVEL_ON_INVITE_ACTIVATE[user.role];
+      if (
+        typeof inviteLevel === 'number' &&
+        user.verificationLevel < inviteLevel
+      ) {
+        user.verificationLevel = inviteLevel;
+      }
+    }
+
     user.lastLoginAt = new Date();
     await user.save();
 
-    return buildAuthResult(toPublicUser(user));
+    const publicUser = toPublicUser(user);
+
+    if (user.instituteId && !publicUser.instituteLogoPath) {
+      const owner = await User.findById(user.instituteId).select(
+        'instituteLogoPath instituteName',
+      );
+      if (owner) {
+        if (owner.instituteLogoPath) {
+          publicUser.instituteLogoPath = owner.instituteLogoPath;
+        }
+        if (!publicUser.instituteName && owner.instituteName) {
+          publicUser.instituteName = owner.instituteName;
+        }
+      }
+    }
+
+    return buildAuthResult(publicUser);
   }
 }
 
-module.exports = { authService: new AuthService() };
+module.exports = {
+  authService: new AuthService(),
+  toPublicUser,
+};

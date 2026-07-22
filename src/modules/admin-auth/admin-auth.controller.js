@@ -15,6 +15,8 @@ class AdminAuthController {
   login = asyncHandler(async (req, res) => {
     const data = await adminAuthService.login({
       loginId: req.body.loginId,
+      email: req.body.email,
+      identifier: req.body.identifier,
       password: req.body.password,
     });
 

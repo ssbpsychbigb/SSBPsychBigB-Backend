@@ -10,6 +10,7 @@ const {
   ADMIN_PERMISSIONS,
   ROLE_DEFAULT_PERMISSIONS,
   VERIFICATION_LEVEL_ON_APPROVE,
+  REJECTION_FIELDS_BY_ROLE,
 } = require('../auth/auth.constants');
 
 /**
@@ -30,6 +31,15 @@ function toApprovalItem(userDoc) {
     officerPhotoPath: json.officerPhotoPath || undefined,
     officerIdDocumentPath: json.officerIdDocumentPath || undefined,
     rejectionReason: json.rejectionReason || undefined,
+    rejectedFields: Array.isArray(json.rejectedFields)
+      ? json.rejectedFields
+      : [],
+    previousRejectionReason: json.previousRejectionReason || undefined,
+    previousRejectedFields: Array.isArray(json.previousRejectedFields)
+      ? json.previousRejectedFields
+      : [],
+    resubmittedAt: json.resubmittedAt || undefined,
+    resubmissionCount: Number(json.resubmissionCount) || 0,
     reviewedAt: json.reviewedAt || undefined,
     createdAt: json.createdAt,
     isMobileVerified: Boolean(json.isMobileVerified),
@@ -74,16 +84,57 @@ function assertCanReviewRole(admin, roleToReview) {
 }
 
 /**
+ * @param {string} role
+ * @param {unknown} fieldsInput
+ * @returns {string[]}
+ */
+function normalizeRejectedFields(role, fieldsInput) {
+  const allowed = new Set(REJECTION_FIELDS_BY_ROLE[role] || []);
+  const raw = Array.isArray(fieldsInput) ? fieldsInput : [];
+  const unique = [
+    ...new Set(
+      raw
+        .map((value) => String(value || '').trim())
+        .filter((value) => value.length > 0),
+    ),
+  ];
+
+  if (unique.length === 0) {
+    throw new AppError(
+      'Select at least one field that needs correction.',
+      HTTP_STATUS.BAD_REQUEST,
+      { code: 'INVALID_REJECTED_FIELDS' },
+    );
+  }
+
+  const invalid = unique.filter((code) => !allowed.has(code));
+  if (invalid.length > 0) {
+    throw new AppError(
+      `Invalid rejection field(s): ${invalid.join(', ')}.`,
+      HTTP_STATUS.BAD_REQUEST,
+      { code: 'INVALID_REJECTED_FIELDS', details: { invalid } },
+    );
+  }
+
+  return unique;
+}
+
+/**
  * Platform approval queue for institute + defence officer applications.
  */
 class AdminApprovalsService {
   /**
-   * @param {{ type?: string }} query
+   * @param {{ type?: string, status?: string }} query
    */
-  async listPending({ type } = {}) {
+  async list({ type, status } = {}) {
+    const queueStatus =
+      status === 'rejected'
+        ? ACCOUNT_STATUS.REJECTED
+        : ACCOUNT_STATUS.PENDING_VERIFICATION;
+
     /** @type {Record<string, unknown>} */
     const filter = {
-      accountStatus: ACCOUNT_STATUS.PENDING_VERIFICATION,
+      accountStatus: queueStatus,
       role: { $in: [APP_ROLES.INSTITUTE, APP_ROLES.DEFENCE_OFFICER] },
     };
 
@@ -93,7 +144,12 @@ class AdminApprovalsService {
       filter.role = APP_ROLES.DEFENCE_OFFICER;
     }
 
-    const users = await User.find(filter).sort({ createdAt: 1 });
+    const sort =
+      queueStatus === ACCOUNT_STATUS.REJECTED
+        ? { reviewedAt: -1, updatedAt: -1 }
+        : { createdAt: 1 };
+
+    const users = await User.find(filter).sort(sort);
     return users.map(toApprovalItem);
   }
 
@@ -131,7 +187,17 @@ class AdminApprovalsService {
     user.accountStatus = ACCOUNT_STATUS.ACTIVE;
     user.verificationLevel =
       VERIFICATION_LEVEL_ON_APPROVE[user.role] ?? user.verificationLevel;
+    if (user.role === APP_ROLES.INSTITUTE) {
+      user.permissions = [
+        ...(ROLE_DEFAULT_PERMISSIONS[APP_ROLES.INSTITUTE] || []),
+      ];
+    }
     user.rejectionReason = '';
+    user.rejectedFields = [];
+    user.previousRejectionReason = '';
+    user.previousRejectedFields = [];
+    user.resubmittedAt = null;
+    user.resubmissionCount = 0;
     user.reviewedAt = new Date();
     user.reviewedByAdminId = admin._id;
     await user.save();
@@ -140,9 +206,14 @@ class AdminApprovalsService {
   }
 
   /**
-   * @param {{ userId: string, admin: import('mongoose').Document, reason?: string }} input
+   * @param {{
+   *   userId: string,
+   *   admin: import('mongoose').Document,
+   *   reason?: string,
+   *   rejectedFields?: unknown,
+   * }} input
    */
-  async reject({ userId, admin, reason }) {
+  async reject({ userId, admin, reason, rejectedFields }) {
     const user = await User.findById(userId);
 
     if (!user) {
@@ -179,8 +250,13 @@ class AdminApprovalsService {
       );
     }
 
+    const fields = normalizeRejectedFields(user.role, rejectedFields);
+
     user.accountStatus = ACCOUNT_STATUS.REJECTED;
     user.rejectionReason = trimmedReason;
+    user.rejectedFields = fields;
+    // * Fresh rejection cycle — clear active resubmit markers.
+    user.resubmittedAt = null;
     user.reviewedAt = new Date();
     user.reviewedByAdminId = admin._id;
     await user.save();

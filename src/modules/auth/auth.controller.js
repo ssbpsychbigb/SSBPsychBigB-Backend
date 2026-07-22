@@ -70,6 +70,23 @@ class AuthController {
       data,
     });
   });
+
+  /**
+   * POST /auth/application/resubmit
+   */
+  resubmitApplication = asyncHandler(async (req, res) => {
+    const data = await authService.resubmitApplication({
+      userId: req.auth.sub,
+      body: req.body,
+      files: req.files || {},
+    });
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Application resubmitted for review',
+      data,
+    });
+  });
 }
 
 module.exports = { authController: new AuthController() };
