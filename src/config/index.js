@@ -59,6 +59,13 @@ const config = Object.freeze({
   otp: Object.freeze({
     length: Number(required('OTP_LENGTH', '6')),
     ttlSeconds: Number(required('OTP_TTL_SECONDS', '300')),
+    /**
+     * Return OTP in API responses until an SMS gateway is wired.
+     * Set OTP_EXPOSE_IN_RESPONSE=false once real SMS delivery ships.
+     */
+    exposeInResponse:
+      String(process.env.OTP_EXPOSE_IN_RESPONSE ?? 'true').toLowerCase() !==
+      'false',
   }),
   upload: Object.freeze({
     dir: required('UPLOAD_DIR', 'uploads'),
