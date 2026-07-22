@@ -152,15 +152,15 @@ async function issueOtpChallenge({ mobileNumber, purpose }) {
   logger.info('OTP issued', {
     mobileNumber,
     purpose,
-    // * Dev-only visibility — production SMS gateway will replace this.
-    ...(config.isProduction ? {} : { debugOtp: otp }),
+    // * Exposed until SMS gateway ships — gate via OTP_EXPOSE_IN_RESPONSE.
+    ...(config.otp.exposeInResponse ? { debugOtp: otp } : {}),
   });
 
   return {
     mobileNumber,
     purpose,
     expiresIn: config.otp.ttlSeconds,
-    ...(config.isProduction ? {} : { debugOtp: otp }),
+    ...(config.otp.exposeInResponse ? { debugOtp: otp } : {}),
   };
 }
 
