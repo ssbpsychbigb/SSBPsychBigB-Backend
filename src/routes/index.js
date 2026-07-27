@@ -28,4 +28,10 @@ apiRouter.use('/admin/staff', adminStaffRouter);
 // * Institute panel APIs — JWT must carry portal: "app"
 apiRouter.use('/institute/team', instituteTeamRouter);
 
+// ! Dev-only: email test + template preview routes
+if (process.env.NODE_ENV !== 'production') {
+  const { mailTestRouter } = require('../common/mail/mail.test-route');
+  apiRouter.use('/dev/mail', mailTestRouter);
+}
+
 module.exports = { apiRouter };

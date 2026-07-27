@@ -9,9 +9,24 @@ const {
   ADMIN_ROLES,
   ADMIN_PERMISSIONS,
   ROLE_DEFAULT_PERMISSIONS,
+  FREELANCER_MASTER_PERMISSIONS,
   VERIFICATION_LEVEL_ON_APPROVE,
   REJECTION_FIELDS_BY_ROLE,
 } = require('../auth/auth.constants');
+const {
+  EducatorProfile,
+  EDUCATOR_PROFILE_TYPES,
+  EDUCATOR_PROFILE_STATUSES,
+} = require('../educator-profile/educator-profile.model');
+const { ensureInstituteCode } = require('../educator-profile/institute-code.util');
+const { mailService } = require('../../common/mail/mail.service');
+
+/** Roles that appear in the platform verification queue. */
+const APPROVAL_QUEUE_ROLES = [
+  APP_ROLES.INSTITUTE,
+  APP_ROLES.DEFENCE_OFFICER,
+  APP_ROLES.EDUCATOR,
+];
 
 /**
  * @param {import('mongoose').Document} userDoc
@@ -30,6 +45,9 @@ function toApprovalItem(userDoc) {
     instituteLogoPath: json.instituteLogoPath || undefined,
     officerPhotoPath: json.officerPhotoPath || undefined,
     officerIdDocumentPath: json.officerIdDocumentPath || undefined,
+    profilePhotoPath: json.profilePhotoPath || undefined,
+    idDocumentPath: json.idDocumentPath || undefined,
+    examGoals: Array.isArray(json.examGoals) ? json.examGoals : [],
     rejectionReason: json.rejectionReason || undefined,
     rejectedFields: Array.isArray(json.rejectedFields)
       ? json.rejectedFields
@@ -81,6 +99,17 @@ function assertCanReviewRole(admin, roleToReview) {
       { code: 'FORBIDDEN' },
     );
   }
+
+  if (
+    roleToReview === APP_ROLES.EDUCATOR &&
+    !granted.has(ADMIN_PERMISSIONS.EDUCATOR_VERIFY)
+  ) {
+    throw new AppError(
+      'You do not have permission to review educator applications.',
+      HTTP_STATUS.FORBIDDEN,
+      { code: 'FORBIDDEN' },
+    );
+  }
 }
 
 /**
@@ -120,7 +149,75 @@ function normalizeRejectedFields(role, fieldsInput) {
 }
 
 /**
- * Platform approval queue for institute + defence officer applications.
+ * True when this educator user is a public freelancer applicant (not faculty).
+ * @param {import('mongoose').Document} user
+ */
+function isFreelancerApplicant(user) {
+  return user.role === APP_ROLES.EDUCATOR && !user.instituteId;
+}
+
+function roleLabel(role) {
+  if (role === APP_ROLES.EDUCATOR) return 'freelancer educator';
+  if (role === APP_ROLES.DEFENCE_OFFICER) return 'defence officer';
+  if (role === APP_ROLES.INSTITUTE) return 'institute';
+  return role;
+}
+
+/**
+ * Syncs freelancer EducatorProfile status with User approval actions.
+ * @param {{
+ *   user: import('mongoose').Document,
+ *   status: string,
+ *   adminId: unknown,
+ *   permissions?: string[],
+ * }} input
+ */
+async function syncFreelancerProfile({ user, status, adminId, permissions }) {
+  if (!isFreelancerApplicant(user)) {
+    return;
+  }
+
+  const profile = await EducatorProfile.findOne({
+    userId: user._id,
+    type: EDUCATOR_PROFILE_TYPES.FREELANCER,
+    status: { $ne: EDUCATOR_PROFILE_STATUSES.DELETED },
+  });
+
+  if (!profile) {
+    return;
+  }
+
+  profile.status = status;
+  profile.displayName = user.fullName || profile.displayName;
+  profile.examGoals = Array.isArray(user.examGoals) ? [...user.examGoals] : [];
+  profile.profilePhotoPath = user.profilePhotoPath || '';
+  profile.idDocumentPath = user.idDocumentPath || '';
+  profile.rejectionReason = user.rejectionReason || '';
+  profile.rejectedFields = Array.isArray(user.rejectedFields)
+    ? [...user.rejectedFields]
+    : [];
+  profile.previousRejectionReason = user.previousRejectionReason || '';
+  profile.previousRejectedFields = Array.isArray(user.previousRejectedFields)
+    ? [...user.previousRejectedFields]
+    : [];
+  profile.resubmittedAt = user.resubmittedAt || null;
+  profile.resubmissionCount = Number(user.resubmissionCount) || 0;
+  profile.reviewedAt = user.reviewedAt || null;
+  profile.reviewedByAdminId = adminId || null;
+
+  if (permissions) {
+    profile.permissions = [...permissions];
+  }
+
+  if (status === EDUCATOR_PROFILE_STATUSES.ACTIVE) {
+    profile.activatedAt = new Date();
+  }
+
+  await profile.save();
+}
+
+/**
+ * Platform approval queue for institute + defence officer + freelancer educator.
  */
 class AdminApprovalsService {
   /**
@@ -135,13 +232,24 @@ class AdminApprovalsService {
     /** @type {Record<string, unknown>} */
     const filter = {
       accountStatus: queueStatus,
-      role: { $in: [APP_ROLES.INSTITUTE, APP_ROLES.DEFENCE_OFFICER] },
+      role: { $in: APPROVAL_QUEUE_ROLES },
+      // * Invited institute faculty share role=educator — exclude them from this queue.
+      $or: [
+        { role: { $in: [APP_ROLES.INSTITUTE, APP_ROLES.DEFENCE_OFFICER] } },
+        { role: APP_ROLES.EDUCATOR, instituteId: null },
+      ],
     };
 
     if (type === 'institute') {
       filter.role = APP_ROLES.INSTITUTE;
+      delete filter.$or;
     } else if (type === 'defence_officer') {
       filter.role = APP_ROLES.DEFENCE_OFFICER;
+      delete filter.$or;
+    } else if (type === 'educator') {
+      filter.role = APP_ROLES.EDUCATOR;
+      filter.instituteId = null;
+      delete filter.$or;
     }
 
     const sort =
@@ -165,10 +273,12 @@ class AdminApprovalsService {
       });
     }
 
-    if (
-      user.role !== APP_ROLES.INSTITUTE &&
-      user.role !== APP_ROLES.DEFENCE_OFFICER
-    ) {
+    const isQueueCandidate =
+      user.role === APP_ROLES.INSTITUTE ||
+      user.role === APP_ROLES.DEFENCE_OFFICER ||
+      isFreelancerApplicant(user);
+
+    if (!isQueueCandidate) {
       throw new AppError('This account is not in the approval queue.', HTTP_STATUS.BAD_REQUEST, {
         code: 'NOT_APPROVAL_CANDIDATE',
       });
@@ -192,6 +302,9 @@ class AdminApprovalsService {
         ...(ROLE_DEFAULT_PERMISSIONS[APP_ROLES.INSTITUTE] || []),
       ];
     }
+    if (isFreelancerApplicant(user)) {
+      user.permissions = [...FREELANCER_MASTER_PERMISSIONS];
+    }
     user.rejectionReason = '';
     user.rejectedFields = [];
     user.previousRejectionReason = '';
@@ -201,6 +314,25 @@ class AdminApprovalsService {
     user.reviewedAt = new Date();
     user.reviewedByAdminId = admin._id;
     await user.save();
+
+    if (user.role === APP_ROLES.INSTITUTE) {
+      await ensureInstituteCode(user);
+    }
+
+    await syncFreelancerProfile({
+      user,
+      status: EDUCATOR_PROFILE_STATUSES.ACTIVE,
+      adminId: admin._id,
+      permissions: isFreelancerApplicant(user)
+        ? [...FREELANCER_MASTER_PERMISSIONS]
+        : undefined,
+    });
+
+    void mailService.notifyApplicationApproved({
+      to: user.email,
+      name: user.fullName || user.instituteName || 'there',
+      roleLabel: roleLabel(user.role),
+    });
 
     return toApprovalItem(user);
   }
@@ -222,10 +354,12 @@ class AdminApprovalsService {
       });
     }
 
-    if (
-      user.role !== APP_ROLES.INSTITUTE &&
-      user.role !== APP_ROLES.DEFENCE_OFFICER
-    ) {
+    const isQueueCandidate =
+      user.role === APP_ROLES.INSTITUTE ||
+      user.role === APP_ROLES.DEFENCE_OFFICER ||
+      isFreelancerApplicant(user);
+
+    if (!isQueueCandidate) {
       throw new AppError('This account is not in the approval queue.', HTTP_STATUS.BAD_REQUEST, {
         code: 'NOT_APPROVAL_CANDIDATE',
       });
@@ -260,6 +394,19 @@ class AdminApprovalsService {
     user.reviewedAt = new Date();
     user.reviewedByAdminId = admin._id;
     await user.save();
+
+    await syncFreelancerProfile({
+      user,
+      status: EDUCATOR_PROFILE_STATUSES.REJECTED,
+      adminId: admin._id,
+    });
+
+    void mailService.notifyApplicationRejected({
+      to: user.email,
+      name: user.fullName || user.instituteName || 'there',
+      roleLabel: roleLabel(user.role),
+      reason: trimmedReason,
+    });
 
     return toApprovalItem(user);
   }

@@ -56,13 +56,14 @@ function fileFilter(_req, file, cb) {
 const registerUpload = multer({
   storage,
   fileFilter,
-  limits: { fileSize: config.upload.maxFileBytes, files: 3 },
+  limits: { fileSize: config.upload.maxFileBytes, files: 5 },
 }).fields([
   { name: 'instituteLogo', maxCount: 1 },
   { name: 'officerPhoto', maxCount: 1 },
   { name: 'officerIdDocument', maxCount: 1 },
+  { name: 'profilePhoto', maxCount: 1 },
+  { name: 'idDocument', maxCount: 1 },
 ]);
-
 /** Optional profile photo for institute team invites / updates. */
 const teamProfileUpload = multer({
   storage,

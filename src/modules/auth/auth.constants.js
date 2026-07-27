@@ -55,12 +55,15 @@ const JOIN_TYPE_TO_ROLE = Object.freeze({
   aspirant: APP_ROLES.ASPIRANT,
   institute: APP_ROLES.INSTITUTE,
   defence_officer: APP_ROLES.DEFENCE_OFFICER,
+  /** Public Freelancer Educator apply path (not institute invite). */
+  educator: APP_ROLES.EDUCATOR,
 });
 
 /** Roles that stay locked until platform admin approval. */
 const PENDING_ON_REGISTER_ROLES = new Set([
   APP_ROLES.INSTITUTE,
   APP_ROLES.DEFENCE_OFFICER,
+  APP_ROLES.EDUCATOR,
 ]);
 
 /**
@@ -92,7 +95,7 @@ const ADMIN_PERMISSION_META = Object.freeze({
   },
   [ADMIN_PERMISSIONS.EDUCATOR_VERIFY]: {
     label: 'Educator verification',
-    description: 'Verify educator profiles when that queue ships.',
+    description: 'Approve or reject freelancer educator applications.',
     group: 'Verification',
   },
   [ADMIN_PERMISSIONS.USERS_READ]: {
@@ -316,6 +319,7 @@ const ROLE_DEFAULT_PERMISSIONS = Object.freeze({
     INSTITUTE_PERMISSIONS.COURSE_DELETE,
     INSTITUTE_PERMISSIONS.EVENTS_PUBLISH,
   ],
+  /** Institute Educator (Limited Rights) — invite path only. */
   [APP_ROLES.EDUCATOR]: [
     INSTITUTE_PERMISSIONS.COURSE_CREATE,
     INSTITUTE_PERMISSIONS.COURSE_PUBLISH,
@@ -330,9 +334,39 @@ const ROLE_DEFAULT_PERMISSIONS = Object.freeze({
   ],
 });
 
+/**
+ * Freelancer Educator Master Rights (personal brand).
+ * Reuses shared learning codes where meaning matches institute catalog.
+ */
+const FREELANCER_PERMISSIONS = Object.freeze({
+  PROFILE_MANAGE: 'educator.profile_manage',
+  COURSE_CREATE: INSTITUTE_PERMISSIONS.COURSE_CREATE,
+  COURSE_EDIT: INSTITUTE_PERMISSIONS.COURSE_EDIT,
+  COURSE_DELETE: INSTITUTE_PERMISSIONS.COURSE_DELETE,
+  COURSE_PUBLISH: INSTITUTE_PERMISSIONS.COURSE_PUBLISH,
+  COURSE_SELL: 'course.sell',
+  PRICING_MANAGE: 'commerce.pricing_manage',
+  DISCOUNT_MANAGE: 'commerce.discount_manage',
+  ASSESSMENT_CREATE: INSTITUTE_PERMISSIONS.ASSESSMENT_CREATE,
+  ASSESSMENT_PUBLISH: INSTITUTE_PERMISSIONS.ASSESSMENT_PUBLISH,
+  LIVE_SCHEDULE: INSTITUTE_PERMISSIONS.LIVE_SCHEDULE,
+  LIVE_START: INSTITUTE_PERMISSIONS.LIVE_START,
+  LIVE_END: INSTITUTE_PERMISSIONS.LIVE_END,
+  MATERIAL_UPLOAD: 'material.upload',
+  STUDENTS_MANAGE: 'students.manage',
+  ANALYTICS_VIEW: 'analytics.view',
+  CERTIFICATES_MANAGE: 'certificates.manage',
+});
+
+const FREELANCER_MASTER_PERMISSIONS = Object.freeze(
+  Object.values(FREELANCER_PERMISSIONS),
+);
+
 const VERIFICATION_LEVEL_ON_APPROVE = Object.freeze({
   [APP_ROLES.INSTITUTE]: 4,
   [APP_ROLES.DEFENCE_OFFICER]: 3,
+  /** Verified Educator (freelancer approve). */
+  [APP_ROLES.EDUCATOR]: 2,
 });
 
 /** Verification level applied when an invited educator activates via OTP. */
@@ -371,6 +405,14 @@ const REJECTION_FIELDS_BY_ROLE = Object.freeze({
     'officerPhoto',
     'officerIdDocument',
   ]),
+  [APP_ROLES.EDUCATOR]: Object.freeze([
+    'fullName',
+    'email',
+    'mobileNumber',
+    'examGoals',
+    'profilePhoto',
+    'idDocument',
+  ]),
 });
 
 const REJECTION_FIELD_LABELS = Object.freeze({
@@ -381,6 +423,9 @@ const REJECTION_FIELD_LABELS = Object.freeze({
   instituteLogo: 'Institute logo',
   officerPhoto: 'Officer photo',
   officerIdDocument: 'ID document',
+  examGoals: 'Exam / prep goals',
+  profilePhoto: 'Profile photo',
+  idDocument: 'ID document',
 });
 
 module.exports = {
@@ -398,6 +443,8 @@ module.exports = {
   INSTITUTE_PERMISSIONS,
   INSTITUTE_PERMISSION_META,
   ROLE_DEFAULT_PERMISSIONS,
+  FREELANCER_PERMISSIONS,
+  FREELANCER_MASTER_PERMISSIONS,
   VERIFICATION_LEVEL_ON_APPROVE,
   VERIFICATION_LEVEL_ON_INVITE_ACTIVATE,
   EXAM_GOAL_CODES,

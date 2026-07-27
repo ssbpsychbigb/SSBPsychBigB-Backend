@@ -18,6 +18,20 @@ const {
   PORTAL,
   EXAM_GOAL_CODES,
 } = require('../auth/auth.constants');
+const {
+  EducatorProfile,
+  EDUCATOR_PROFILE_TYPES,
+  EDUCATOR_PROFILE_STATUSES,
+} = require('../educator-profile/educator-profile.model');
+const { toProfileSummary } = require('../educator-profile/educator-collab.service');
+const { ensureInstituteCode } = require('../educator-profile/institute-code.util');
+const {
+  educatorHrService,
+  syncProfileLifecycle,
+  findOpenCollab,
+  OPEN_COLLAB_STATUSES,
+} = require('../educator-profile/educator-hr.service');
+const { mailService } = require('../../common/mail/mail.service');
 
 const ALL_INSTITUTE_PERMISSION_CODES = new Set(
   Object.values(INSTITUTE_PERMISSIONS),
@@ -167,6 +181,45 @@ function toTeamMember(member) {
     ...user,
     instituteId: user.instituteId,
     invitedByUserId: user.invitedByUserId,
+    membershipKind: 'legacy',
+  };
+}
+
+/**
+ * Profile-backed collab row for institute team directory.
+ * @param {import('mongoose').Document} profile
+ * @param {import('mongoose').Document} memberUser
+ * @param {import('mongoose').Document | null} institute
+ */
+function toProfileTeamMember(profile, memberUser, institute) {
+  const summary = toProfileSummary(profile, institute);
+  const user = toPublicUser(memberUser);
+  return {
+    ...user,
+    id: summary.id,
+    userId: user.id,
+    role: APP_ROLES.EDUCATOR,
+    accountStatus: summary.status,
+    instituteId: summary.instituteId,
+    permissions: summary.permissions,
+    examGoals: summary.examGoals,
+    profilePhotoPath: summary.profilePhotoPath || user.profilePhotoPath,
+    invitedByUserId: summary.invitedByUserId,
+    joinSource: summary.joinSource,
+    membershipKind: 'profile',
+    createdAt: summary.createdAt,
+    leaveReason: summary.leaveReason,
+    leaveStartsAt: summary.leaveStartsAt,
+    leaveEndsAt: summary.leaveEndsAt,
+    leaveRequestedAt: summary.leaveRequestedAt,
+    resignReason: summary.resignReason,
+    resignRequestedAt: summary.resignRequestedAt,
+    noticeStartedAt: summary.noticeStartedAt,
+    noticeEndsAt: summary.noticeEndsAt,
+    noticeDays: summary.noticeDays,
+    exitReason: summary.exitReason,
+    endedAt: summary.endedAt,
+    endedBy: summary.endedBy,
   };
 }
 
@@ -237,7 +290,57 @@ class InstituteTeamService {
       .sort({ createdAt: -1 })
       .limit(300);
 
-    return members.map(toTeamMember);
+    const legacy = members.map(toTeamMember);
+    const legacyUserIds = new Set(legacy.map((row) => row.id));
+
+    const collabProfiles = await EducatorProfile.find({
+      type: EDUCATOR_PROFILE_TYPES.INSTITUTE,
+      instituteId,
+      status: { $in: [...OPEN_COLLAB_STATUSES] },
+    })
+      .sort({ createdAt: -1 })
+      .limit(300);
+
+    for (const profile of collabProfiles) {
+      await syncProfileLifecycle(profile);
+    }
+
+    const liveCollabs = collabProfiles.filter((row) =>
+      OPEN_COLLAB_STATUSES.includes(row.status),
+    );
+
+    const userIds = [
+      ...new Set(liveCollabs.map((row) => String(row.userId))),
+    ];
+    const users =
+      userIds.length > 0
+        ? await User.find({ _id: { $in: userIds } })
+        : [];
+    /** @type {Map<string, import('mongoose').Document>} */
+    const userMap = new Map(users.map((row) => [String(row._id), row]));
+
+    const owner = await User.findById(instituteId).select(
+      'instituteName fullName instituteLogoPath instituteCode',
+    );
+
+    const profileRows = [];
+    for (const profile of liveCollabs) {
+      const memberUser = userMap.get(String(profile.userId));
+      if (!memberUser) {
+        continue;
+      }
+      // * Skip legacy faculty who already appear via User.instituteId.
+      if (
+        memberUser.instituteId &&
+        String(memberUser.instituteId) === instituteId &&
+        legacyUserIds.has(String(memberUser._id))
+      ) {
+        continue;
+      }
+      profileRows.push(toProfileTeamMember(profile, memberUser, owner));
+    }
+
+    return [...profileRows, ...legacy];
   }
 
   /**
@@ -367,11 +470,18 @@ class InstituteTeamService {
 
     const existing = await User.findOne({ mobileNumber: normalizedMobile });
     if (existing) {
-      throw new AppError(
-        'This mobile number is already registered on BIGB.',
-        HTTP_STATUS.CONFLICT,
-        { code: 'MOBILE_ALREADY_REGISTERED' },
-      );
+      return this.#inviteExistingFreelancer({
+        existing,
+        nextRole,
+        name,
+        normalizedEmail,
+        nextExamGoals,
+        nextPermissions,
+        profilePhotoPath,
+        instituteId,
+        owner,
+        actor,
+      });
     }
 
     const photoPath = String(profilePhotoPath || '').trim();
@@ -396,6 +506,21 @@ class InstituteTeamService {
         profilePhotoPath: photoPath,
       });
 
+      if (nextRole === APP_ROLES.EDUCATOR) {
+        await EducatorProfile.create({
+          userId: member._id,
+          type: EDUCATOR_PROFILE_TYPES.INSTITUTE,
+          instituteId,
+          status: EDUCATOR_PROFILE_STATUSES.INVITED,
+          permissions: nextPermissions,
+          displayName: name,
+          examGoals: nextExamGoals,
+          profilePhotoPath: photoPath,
+          invitedByUserId: actor._id,
+          joinSource: 'legacy_invite',
+        });
+      }
+
       return toTeamMember(member);
     } catch (error) {
       if (error && error.code === 11000) {
@@ -407,6 +532,445 @@ class InstituteTeamService {
       }
       throw error;
     }
+  }
+
+  /**
+   * Hires an already-registered freelancer without creating a second User.
+   * @param {{
+   *   existing: import('mongoose').Document,
+   *   nextRole: string,
+   *   name: string,
+   *   normalizedEmail: string,
+   *   nextExamGoals: string[],
+   *   nextPermissions: string[],
+   *   profilePhotoPath?: string,
+   *   instituteId: string,
+   *   owner: import('mongoose').Document,
+   *   actor: import('mongoose').Document,
+   * }} input
+   */
+  async #inviteExistingFreelancer({
+    existing,
+    nextRole,
+    name,
+    normalizedEmail,
+    nextExamGoals,
+    nextPermissions,
+    profilePhotoPath,
+    instituteId,
+    owner,
+    actor,
+  }) {
+    if (nextRole !== APP_ROLES.EDUCATOR) {
+      throw new AppError(
+        'This mobile number is already registered on BIGB.',
+        HTTP_STATUS.CONFLICT,
+        { code: 'MOBILE_ALREADY_REGISTERED' },
+      );
+    }
+
+    const isFreelancer =
+      existing.role === APP_ROLES.EDUCATOR &&
+      !existing.instituteId &&
+      existing.accountStatus === ACCOUNT_STATUS.ACTIVE;
+
+    if (!isFreelancer) {
+      throw new AppError(
+        'This mobile number is already registered on BIGB.',
+        HTTP_STATUS.CONFLICT,
+        { code: 'MOBILE_ALREADY_REGISTERED' },
+      );
+    }
+
+    const freelancerProfile = await EducatorProfile.findOne({
+      userId: existing._id,
+      type: EDUCATOR_PROFILE_TYPES.FREELANCER,
+      status: EDUCATOR_PROFILE_STATUSES.ACTIVE,
+    });
+    if (!freelancerProfile) {
+      throw new AppError(
+        'This educator is not an approved freelancer yet.',
+        HTTP_STATUS.BAD_REQUEST,
+        { code: 'NOT_APPROVED_FREELANCER' },
+      );
+    }
+
+    const already = await findOpenCollab(existing._id, instituteId);
+    if (already) {
+      throw new AppError(
+        already.status === EDUCATOR_PROFILE_STATUSES.ACTIVE
+          ? 'This educator already collaborates with your institute.'
+          : 'An invite or collaboration already exists for this educator.',
+        HTTP_STATUS.CONFLICT,
+        { code: 'COLLAB_EXISTS' },
+      );
+    }
+
+    const photoPath =
+      String(profilePhotoPath || '').trim() ||
+      existing.profilePhotoPath ||
+      freelancerProfile.profilePhotoPath ||
+      '';
+
+    const profile = await EducatorProfile.create({
+      userId: existing._id,
+      type: EDUCATOR_PROFILE_TYPES.INSTITUTE,
+      instituteId,
+      status: EDUCATOR_PROFILE_STATUSES.INVITED,
+      permissions: nextPermissions,
+      displayName: name || existing.fullName || freelancerProfile.displayName,
+      examGoals:
+        nextExamGoals.length > 0
+          ? nextExamGoals
+          : Array.isArray(existing.examGoals)
+            ? [...existing.examGoals]
+            : [],
+      profilePhotoPath: photoPath,
+      invitedByUserId: actor._id,
+      joinSource: 'institute_hire',
+    });
+
+    // * Keep identity email/name in sync when institute provides fresher hire details.
+    if (name && name.length >= 2 && name !== existing.fullName) {
+      existing.fullName = name;
+    }
+    if (normalizedEmail && normalizedEmail !== existing.email) {
+      existing.email = normalizedEmail;
+    }
+    await existing.save();
+
+    void mailService.notifyHireInvite({
+      to: existing.email,
+      educatorName: existing.fullName || 'there',
+      instituteName: owner.instituteName || owner.fullName || 'Institute',
+    });
+
+    return toProfileTeamMember(profile, existing, owner);
+  }
+
+  /**
+   * Institute accepts an educator-initiated join request.
+   * @param {{ profileId: string, actor: import('mongoose').Document }} input
+   */
+  async acceptJoinRequest({ profileId, actor }) {
+    const instituteId = resolveActorInstituteId(actor);
+    const canAdd =
+      actor.role === APP_ROLES.INSTITUTE ||
+      resolveActorPermissions(actor).includes(
+        INSTITUTE_PERMISSIONS.FACULTY_ADD,
+      ) ||
+      resolveActorPermissions(actor).includes(
+        INSTITUTE_PERMISSIONS.TEAM_MANAGE,
+      );
+    if (!canAdd) {
+      throw new AppError(
+        'You do not have permission to accept educator join requests.',
+        HTTP_STATUS.FORBIDDEN,
+        { code: 'INSTITUTE_FORBIDDEN' },
+      );
+    }
+
+    const profile = await EducatorProfile.findOne({
+      _id: profileId,
+      type: EDUCATOR_PROFILE_TYPES.INSTITUTE,
+      instituteId,
+      status: EDUCATOR_PROFILE_STATUSES.INVITED,
+      joinSource: 'educator_request',
+    });
+
+    if (!profile) {
+      throw new AppError('Join request not found.', HTTP_STATUS.NOT_FOUND, {
+        code: 'JOIN_REQUEST_NOT_FOUND',
+      });
+    }
+
+    profile.status = EDUCATOR_PROFILE_STATUSES.ACTIVE;
+    profile.activatedAt = new Date();
+    if (!profile.permissions?.length) {
+      profile.permissions = [
+        ...(ROLE_DEFAULT_PERMISSIONS[APP_ROLES.EDUCATOR] || []),
+      ];
+    }
+    await profile.save();
+
+    const memberUser = await User.findById(profile.userId);
+    const owner = await User.findById(instituteId).select(
+      'instituteName fullName instituteLogoPath instituteCode',
+    );
+    if (!memberUser) {
+      throw new AppError('Educator account not found.', HTTP_STATUS.NOT_FOUND, {
+        code: 'USER_NOT_FOUND',
+      });
+    }
+
+    void mailService.notifyJoinAccepted({
+      to: memberUser.email,
+      instituteName: owner?.instituteName || owner?.fullName || 'Institute',
+    });
+
+    return toProfileTeamMember(profile, memberUser, owner);
+  }
+
+  /**
+   * Institute rejects an educator-initiated join request.
+   * @param {{ profileId: string, actor: import('mongoose').Document }} input
+   */
+  async rejectJoinRequest({ profileId, actor }) {
+    const instituteId = resolveActorInstituteId(actor);
+    const canAdd =
+      actor.role === APP_ROLES.INSTITUTE ||
+      resolveActorPermissions(actor).includes(
+        INSTITUTE_PERMISSIONS.FACULTY_ADD,
+      ) ||
+      resolveActorPermissions(actor).includes(
+        INSTITUTE_PERMISSIONS.TEAM_MANAGE,
+      );
+    if (!canAdd) {
+      throw new AppError(
+        'You do not have permission to reject educator join requests.',
+        HTTP_STATUS.FORBIDDEN,
+        { code: 'INSTITUTE_FORBIDDEN' },
+      );
+    }
+
+    const profile = await EducatorProfile.findOne({
+      _id: profileId,
+      type: EDUCATOR_PROFILE_TYPES.INSTITUTE,
+      instituteId,
+      status: EDUCATOR_PROFILE_STATUSES.INVITED,
+      joinSource: 'educator_request',
+    });
+
+    if (!profile) {
+      throw new AppError('Join request not found.', HTTP_STATUS.NOT_FOUND, {
+        code: 'JOIN_REQUEST_NOT_FOUND',
+      });
+    }
+
+    profile.status = EDUCATOR_PROFILE_STATUSES.DELETED;
+    await profile.save();
+    const memberUser = await User.findById(profile.userId).select('email');
+    const owner = await User.findById(instituteId).select(
+      'instituteName fullName',
+    );
+    void mailService.notifyJoinRejected({
+      to: memberUser?.email,
+      instituteName: owner?.instituteName || owner?.fullName || 'Institute',
+    });
+    return { id: String(profile._id), deleted: true };
+  }
+
+  /**
+   * Returns institute code for the actor's institute (owners/admins).
+   * @param {{ actor: import('mongoose').Document }} input
+   */
+  async getInstituteCode({ actor }) {
+    const instituteId = resolveActorInstituteId(actor);
+    const owner = await User.findById(instituteId);
+    if (!owner || owner.role !== APP_ROLES.INSTITUTE) {
+      throw new AppError('Institute not found.', HTTP_STATUS.NOT_FOUND, {
+        code: 'INSTITUTE_NOT_FOUND',
+      });
+    }
+    const code = await ensureInstituteCode(owner);
+    return {
+      instituteId: String(owner._id),
+      instituteName: owner.instituteName || owner.fullName || '',
+      instituteCode: code,
+    };
+  }
+
+  /**
+   * Search approved freelancer educators to hire by name (or mobile).
+   * @param {{ actor: import('mongoose').Document, q?: string }} input
+   */
+  async searchFreelancers({ actor, q }) {
+    const instituteId = resolveActorInstituteId(actor);
+    const canAdd =
+      actor.role === APP_ROLES.INSTITUTE ||
+      resolveActorPermissions(actor).includes(
+        INSTITUTE_PERMISSIONS.FACULTY_ADD,
+      ) ||
+      resolveActorPermissions(actor).includes(
+        INSTITUTE_PERMISSIONS.TEAM_MANAGE,
+      );
+    if (!canAdd) {
+      throw new AppError(
+        'You do not have permission to hire educators.',
+        HTTP_STATUS.FORBIDDEN,
+        { code: 'INSTITUTE_FORBIDDEN' },
+      );
+    }
+
+    const query = String(q || '').trim();
+    /** @type {Record<string, unknown>} */
+    const userFilter = {
+      role: APP_ROLES.EDUCATOR,
+      accountStatus: ACCOUNT_STATUS.ACTIVE,
+      instituteId: null,
+    };
+
+    if (query) {
+      const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const digits = query.replace(/\D/g, '');
+      userFilter.$or = [
+        { fullName: { $regex: escaped, $options: 'i' } },
+        { email: { $regex: escaped, $options: 'i' } },
+      ];
+      if (digits.length >= 4) {
+        userFilter.$or.push({
+          mobileNumber: { $regex: digits, $options: 'i' },
+        });
+      }
+    }
+
+    const candidates = await User.find(userFilter)
+      .select(
+        'fullName email mobileNumber examGoals profilePhotoPath verificationLevel',
+      )
+      .sort({ fullName: 1 })
+      .limit(40);
+
+    if (candidates.length === 0) {
+      return [];
+    }
+
+    const userIds = candidates.map((row) => row._id);
+    const freelancerProfiles = await EducatorProfile.find({
+      userId: { $in: userIds },
+      type: EDUCATOR_PROFILE_TYPES.FREELANCER,
+      status: EDUCATOR_PROFILE_STATUSES.ACTIVE,
+    }).select('userId');
+
+    const approvedIds = new Set(
+      freelancerProfiles.map((row) => String(row.userId)),
+    );
+
+    const existingCollabs = await EducatorProfile.find({
+      userId: { $in: userIds },
+      type: EDUCATOR_PROFILE_TYPES.INSTITUTE,
+      instituteId,
+      status: { $in: [...OPEN_COLLAB_STATUSES] },
+    }).select('userId status');
+
+    /** @type {Map<string, string>} */
+    const collabStatus = new Map(
+      existingCollabs.map((row) => [String(row.userId), row.status]),
+    );
+
+    return candidates
+      .filter((row) => approvedIds.has(String(row._id)))
+      .map((row) => {
+        const id = String(row._id);
+        return {
+          id,
+          fullName: row.fullName || '',
+          email: row.email || '',
+          mobileNumber: row.mobileNumber || '',
+          examGoals: Array.isArray(row.examGoals) ? row.examGoals : [],
+          profilePhotoPath: row.profilePhotoPath || undefined,
+          verificationLevel: row.verificationLevel || 0,
+          collabStatus: collabStatus.get(id) || null,
+        };
+      });
+  }
+
+  /**
+   * Hire a freelancer by user id (name-picker path — mobile optional on UI).
+   * @param {{
+   *   actor: import('mongoose').Document,
+   *   freelancerUserId: string,
+   *   permissions?: string[] | string,
+   *   examGoals?: string[] | string,
+   * }} input
+   */
+  async hireFreelancerById({
+    actor,
+    freelancerUserId,
+    permissions,
+    examGoals,
+  }) {
+    const instituteId = resolveActorInstituteId(actor);
+    const canAdd =
+      actor.role === APP_ROLES.INSTITUTE ||
+      resolveActorPermissions(actor).includes(
+        INSTITUTE_PERMISSIONS.FACULTY_ADD,
+      ) ||
+      resolveActorPermissions(actor).includes(
+        INSTITUTE_PERMISSIONS.TEAM_MANAGE,
+      );
+    if (!canAdd) {
+      throw new AppError(
+        'You do not have permission to hire educators.',
+        HTTP_STATUS.FORBIDDEN,
+        { code: 'INSTITUTE_FORBIDDEN' },
+      );
+    }
+
+    const owner = await User.findById(instituteId);
+    if (
+      !owner ||
+      owner.role !== APP_ROLES.INSTITUTE ||
+      owner.accountStatus !== ACCOUNT_STATUS.ACTIVE
+    ) {
+      throw new AppError(
+        'Institute account is not active.',
+        HTTP_STATUS.BAD_REQUEST,
+        { code: 'INSTITUTE_NOT_ACTIVE' },
+      );
+    }
+
+    const existing = await User.findById(freelancerUserId);
+    if (!existing) {
+      throw new AppError('Educator not found.', HTTP_STATUS.NOT_FOUND, {
+        code: 'USER_NOT_FOUND',
+      });
+    }
+
+    const defaults = ROLE_DEFAULT_PERMISSIONS[APP_ROLES.EDUCATOR] || [];
+    const parsedPermissions = parsePermissionsField(permissions);
+    let nextPermissions =
+      parsedPermissions === undefined ? [...defaults] : parsedPermissions;
+
+    const canAssignRoles =
+      actor.role === APP_ROLES.INSTITUTE ||
+      resolveActorPermissions(actor).includes(
+        INSTITUTE_PERMISSIONS.ROLES_ASSIGN,
+      );
+    if (!canAssignRoles) {
+      nextPermissions = [...defaults];
+    }
+
+    const nextExamGoals = sanitizeExamGoals(
+      examGoals !== undefined ? examGoals : existing.examGoals,
+    );
+    const resolvedExamGoals =
+      nextExamGoals.length > 0
+        ? nextExamGoals
+        : Array.isArray(existing.examGoals)
+          ? [...existing.examGoals]
+          : [];
+
+    if (resolvedExamGoals.length === 0) {
+      throw new AppError(
+        'This educator has no exam goals on file. Ask them to update their profile, or hire via full invite form.',
+        HTTP_STATUS.BAD_REQUEST,
+        { code: 'EXAM_GOALS_REQUIRED' },
+      );
+    }
+
+    return this.#inviteExistingFreelancer({
+      existing,
+      nextRole: APP_ROLES.EDUCATOR,
+      name: existing.fullName || 'Educator',
+      normalizedEmail: existing.email,
+      nextExamGoals: resolvedExamGoals,
+      nextPermissions,
+      profilePhotoPath: existing.profilePhotoPath || '',
+      instituteId,
+      owner,
+      actor,
+    });
   }
 
   /**
@@ -625,6 +1189,102 @@ class InstituteTeamService {
     member.accountStatus = ACCOUNT_STATUS.DELETED;
     await member.save();
     return toTeamMember(member);
+  }
+
+  /**
+   * @param {{ profileId: string, decision: 'accept'|'reject', note?: string, actor: import('mongoose').Document }} input
+   */
+  async decideLeaveRequest({ profileId, decision, note, actor }) {
+    const instituteId = resolveActorInstituteId(actor);
+    const profile = await educatorHrService.decideLeave({
+      actor,
+      instituteId,
+      profileId,
+      decision,
+      note,
+    });
+    const memberUser = await User.findById(profile.userId);
+    const owner = await User.findById(instituteId).select(
+      'instituteName fullName instituteLogoPath instituteCode',
+    );
+    if (!memberUser) {
+      throw new AppError('Educator not found.', HTTP_STATUS.NOT_FOUND, {
+        code: 'USER_NOT_FOUND',
+      });
+    }
+    return toProfileTeamMember(profile, memberUser, owner);
+  }
+
+  /**
+   * @param {{ profileId: string, decision: 'accept'|'reject', note?: string, actor: import('mongoose').Document }} input
+   */
+  async decideResignRequest({ profileId, decision, note, actor }) {
+    const instituteId = resolveActorInstituteId(actor);
+    const profile = await educatorHrService.decideResign({
+      actor,
+      instituteId,
+      profileId,
+      decision,
+      note,
+    });
+    const memberUser = await User.findById(profile.userId);
+    const owner = await User.findById(instituteId).select(
+      'instituteName fullName instituteLogoPath instituteCode',
+    );
+    if (!memberUser) {
+      throw new AppError('Educator not found.', HTTP_STATUS.NOT_FOUND, {
+        code: 'USER_NOT_FOUND',
+      });
+    }
+    return toProfileTeamMember(profile, memberUser, owner);
+  }
+
+  /**
+   * Immediate fire / release for profile-backed faculty.
+   * @param {{ profileId: string, reason: string, actor: import('mongoose').Document }} input
+   */
+  async fireProfileMember({ profileId, reason, actor }) {
+    const instituteId = resolveActorInstituteId(actor);
+    const profile = await educatorHrService.fireEducator({
+      actor,
+      instituteId,
+      profileId,
+      reason,
+    });
+    const memberUser = await User.findById(profile.userId);
+    const owner = await User.findById(instituteId).select(
+      'instituteName fullName instituteLogoPath instituteCode',
+    );
+    if (!memberUser) {
+      throw new AppError('Educator not found.', HTTP_STATUS.NOT_FOUND, {
+        code: 'USER_NOT_FOUND',
+      });
+    }
+    return toProfileTeamMember(profile, memberUser, owner);
+  }
+
+  /**
+   * End notice early after resign accepted.
+   * @param {{ profileId: string, reason: string, actor: import('mongoose').Document }} input
+   */
+  async releaseNoticeEarly({ profileId, reason, actor }) {
+    const instituteId = resolveActorInstituteId(actor);
+    const profile = await educatorHrService.releaseDuringNotice({
+      actor,
+      instituteId,
+      profileId,
+      reason,
+    });
+    const memberUser = await User.findById(profile.userId);
+    const owner = await User.findById(instituteId).select(
+      'instituteName fullName instituteLogoPath instituteCode',
+    );
+    if (!memberUser) {
+      throw new AppError('Educator not found.', HTTP_STATUS.NOT_FOUND, {
+        code: 'USER_NOT_FOUND',
+      });
+    }
+    return toProfileTeamMember(profile, memberUser, owner);
   }
 }
 
