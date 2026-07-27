@@ -24,6 +24,7 @@ adminApprovalsRouter.get(
   requireAdminPermission(
     ADMIN_PERMISSIONS.INSTITUTE_VERIFY,
     ADMIN_PERMISSIONS.OFFICER_VERIFY,
+    ADMIN_PERMISSIONS.EDUCATOR_VERIFY,
   ),
   adminApprovalsController.listPending,
 );
@@ -33,6 +34,7 @@ adminApprovalsRouter.post(
   requireAdminPermission(
     ADMIN_PERMISSIONS.INSTITUTE_VERIFY,
     ADMIN_PERMISSIONS.OFFICER_VERIFY,
+    ADMIN_PERMISSIONS.EDUCATOR_VERIFY,
   ),
   adminApprovalsController.approve,
 );
@@ -42,6 +44,7 @@ adminApprovalsRouter.post(
   requireAdminPermission(
     ADMIN_PERMISSIONS.INSTITUTE_VERIFY,
     ADMIN_PERMISSIONS.OFFICER_VERIFY,
+    ADMIN_PERMISSIONS.EDUCATOR_VERIFY,
   ),
   adminApprovalsController.reject,
 );

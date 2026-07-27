@@ -3,7 +3,15 @@
 const { asyncHandler } = require('../../common/middleware/asyncHandler');
 const { ApiResponse } = require('../../common/utils/ApiResponse');
 const { HTTP_STATUS } = require('../../common/constants/httpStatus');
-const { authService } = require('./auth.service');
+const { authService, toPublicUser } = require('./auth.service');
+const { User } = require('./user.model');
+const {
+  educatorCollabService,
+  toProfileSummary,
+} = require('../educator-profile/educator-collab.service');
+const {
+  educatorHrService,
+} = require('../educator-profile/educator-hr.service');
 
 /**
  * Auth HTTP handlers for app-portal OTP registration and login.
@@ -84,6 +92,169 @@ class AuthController {
     return ApiResponse.success(res, {
       statusCode: HTTP_STATUS.OK,
       message: 'Application resubmitted for review',
+      data,
+    });
+  });
+
+  /**
+   * POST /auth/educator/join-requests
+   */
+  requestJoin = asyncHandler(async (req, res) => {
+    const data = await educatorCollabService.requestJoin({
+      userId: req.auth.sub,
+      instituteCode: req.body.instituteCode,
+      instituteId: req.body.instituteId,
+    });
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.CREATED,
+      message: 'Join request sent. Wait for the institute to accept.',
+      data,
+    });
+  });
+
+  /**
+   * GET /auth/educator/institutes?q=
+   */
+  listInstitutes = asyncHandler(async (req, res) => {
+    const data = await educatorCollabService.listInstitutes({
+      userId: req.auth.sub,
+      q: req.query.q,
+    });
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Institutes',
+      data,
+    });
+  });
+
+  /**
+   * POST /auth/educator/collaborations/:profileId/accept
+   */
+  acceptHire = asyncHandler(async (req, res) => {
+    const data = await educatorCollabService.acceptHireInvite({
+      userId: req.auth.sub,
+      profileId: req.params.profileId,
+    });
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Hire invite accepted',
+      data,
+    });
+  });
+
+  /**
+   * POST /auth/educator/collaborations/:profileId/decline
+   */
+  declineCollab = asyncHandler(async (req, res) => {
+    const data = await educatorCollabService.declineOrCancelCollab({
+      userId: req.auth.sub,
+      profileId: req.params.profileId,
+    });
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Collaboration cancelled',
+      data,
+    });
+  });
+
+  /**
+   * POST /auth/educator/collaborations/:profileId/leave
+   */
+  requestLeave = asyncHandler(async (req, res) => {
+    const profile = await educatorHrService.requestLeave({
+      userId: req.auth.sub,
+      profileId: req.params.profileId,
+      reason: req.body.reason,
+      leaveStartsAt: req.body.leaveStartsAt,
+      leaveEndsAt: req.body.leaveEndsAt,
+    });
+    const institute = await User.findById(profile.instituteId).select(
+      'instituteName fullName instituteLogoPath instituteCode',
+    );
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Leave request sent to the institute.',
+      data: toProfileSummary(profile, institute),
+    });
+  });
+
+  /**
+   * POST /auth/educator/collaborations/:profileId/leave/cancel
+   */
+  cancelLeave = asyncHandler(async (req, res) => {
+    const profile = await educatorHrService.cancelLeaveRequest({
+      userId: req.auth.sub,
+      profileId: req.params.profileId,
+    });
+    const institute = await User.findById(profile.instituteId).select(
+      'instituteName fullName instituteLogoPath instituteCode',
+    );
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Leave request cancelled.',
+      data: toProfileSummary(profile, institute),
+    });
+  });
+
+  /**
+   * POST /auth/educator/collaborations/:profileId/resign
+   */
+  requestResign = asyncHandler(async (req, res) => {
+    const profile = await educatorHrService.requestResign({
+      userId: req.auth.sub,
+      profileId: req.params.profileId,
+      reason: req.body.reason,
+    });
+    const institute = await User.findById(profile.instituteId).select(
+      'instituteName fullName instituteLogoPath instituteCode',
+    );
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message:
+        'Resign request sent. Notice period starts only after the institute accepts.',
+      data: toProfileSummary(profile, institute),
+    });
+  });
+
+  /**
+   * POST /auth/educator/collaborations/:profileId/resign/cancel
+   */
+  cancelResign = asyncHandler(async (req, res) => {
+    const profile = await educatorHrService.cancelResignRequest({
+      userId: req.auth.sub,
+      profileId: req.params.profileId,
+    });
+    const institute = await User.findById(profile.instituteId).select(
+      'instituteName fullName instituteLogoPath instituteCode',
+    );
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Resign request cancelled.',
+      data: toProfileSummary(profile, institute),
+    });
+  });
+
+  /**
+   * POST /auth/profiles/:profileId/switch
+   */
+  switchProfile = asyncHandler(async (req, res) => {
+    const data = await educatorCollabService.switchProfile({
+      userId: req.auth.sub,
+      profileId: req.params.profileId,
+      toPublicUser,
+    });
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Profile switched',
       data,
     });
   });

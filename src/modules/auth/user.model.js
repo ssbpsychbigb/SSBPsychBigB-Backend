@@ -94,6 +94,27 @@ const userSchema = new mongoose.Schema(
       type: String,
       default: '',
     },
+    /** Freelancer educator ID proof (synced from EducatorProfile for approvals UX). */
+    idDocumentPath: {
+      type: String,
+      default: '',
+    },
+    /**
+     * Public code for institutes (hire / join). Unique when set.
+     * Only meaningful for role=institute owners.
+     */
+    instituteCode: {
+      type: String,
+      trim: true,
+      uppercase: true,
+      default: '',
+    },
+    /** Active EducatorProfile (freelancer or institute membership) for this session. */
+    activeProfileId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'EducatorProfile',
+      default: null,
+    },
     /**
      * Owner User id for institute-scoped members (institute_admin / educator).
      * Null for aspirants, defence officers, and institute owners themselves.
@@ -173,6 +194,13 @@ userSchema.index({ email: 1 });
 userSchema.index({ role: 1, accountStatus: 1 });
 userSchema.index({ isMobileVerified: 1 });
 userSchema.index({ instituteId: 1, role: 1, accountStatus: 1 });
+userSchema.index(
+  { instituteCode: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { instituteCode: { $type: 'string', $gt: '' } },
+  },
+);
 
 const User = mongoose.model('User', userSchema);
 

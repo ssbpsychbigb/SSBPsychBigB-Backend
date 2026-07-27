@@ -26,5 +26,50 @@ authRouter.post(
   registerUpload,
   authController.resubmitApplication,
 );
+authRouter.post(
+  '/educator/join-requests',
+  requireAppAuth,
+  authController.requestJoin,
+);
+authRouter.get(
+  '/educator/institutes',
+  requireAppAuth,
+  authController.listInstitutes,
+);
+authRouter.post(
+  '/educator/collaborations/:profileId/accept',
+  requireAppAuth,
+  authController.acceptHire,
+);
+authRouter.post(
+  '/educator/collaborations/:profileId/decline',
+  requireAppAuth,
+  authController.declineCollab,
+);
+authRouter.post(
+  '/educator/collaborations/:profileId/leave',
+  requireAppAuth,
+  authController.requestLeave,
+);
+authRouter.post(
+  '/educator/collaborations/:profileId/leave/cancel',
+  requireAppAuth,
+  authController.cancelLeave,
+);
+authRouter.post(
+  '/educator/collaborations/:profileId/resign',
+  requireAppAuth,
+  authController.requestResign,
+);
+authRouter.post(
+  '/educator/collaborations/:profileId/resign/cancel',
+  requireAppAuth,
+  authController.cancelResign,
+);
+authRouter.post(
+  '/profiles/:profileId/switch',
+  requireAppAuth,
+  authController.switchProfile,
+);
 
 module.exports = { authRouter };

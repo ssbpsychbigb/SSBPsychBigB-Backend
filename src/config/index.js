@@ -71,6 +71,29 @@ const config = Object.freeze({
     dir: required('UPLOAD_DIR', 'uploads'),
     maxFileBytes: Number(required('UPLOAD_MAX_BYTES', String(5 * 1024 * 1024))),
   }),
+  features: Object.freeze({
+    /**
+     * Public Freelancer Educator registration.
+     * Set EDUCATOR_FREELANCER_REGISTER=false to hide/disable the join path.
+     */
+    educatorFreelancerRegister:
+      String(process.env.EDUCATOR_FREELANCER_REGISTER ?? 'true').toLowerCase() !==
+      'false',
+  }),
+  email: Object.freeze({
+    enabled:
+      String(process.env.EMAIL_ENABLED ?? 'false').toLowerCase() === 'true',
+    from: String(process.env.EMAIL_FROM ?? '').trim(),
+    appPublicUrl: required('APP_PUBLIC_URL', 'http://localhost:5173'),
+    smtp: Object.freeze({
+      host: String(process.env.SMTP_HOST ?? '').trim(),
+      port: Number(process.env.SMTP_PORT ?? '587'),
+      secure:
+        String(process.env.SMTP_SECURE ?? 'false').toLowerCase() === 'true',
+      user: String(process.env.SMTP_USER ?? '').trim(),
+      pass: String(process.env.SMTP_PASS ?? '').trim(),
+    }),
+  }),
 });
 
 module.exports = config;

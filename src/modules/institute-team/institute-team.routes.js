@@ -29,11 +29,41 @@ instituteTeamRouter.use(
 );
 
 instituteTeamRouter.get('/catalog', instituteTeamController.catalog);
+instituteTeamRouter.get('/code', instituteTeamController.instituteCode);
+instituteTeamRouter.get(
+  '/freelancers',
+  instituteTeamController.searchFreelancers,
+);
 instituteTeamRouter.get('/', instituteTeamController.list);
 instituteTeamRouter.post(
   '/',
   teamProfileUpload,
   instituteTeamController.invite,
+);
+instituteTeamRouter.post('/hire', instituteTeamController.hireFreelancer);
+instituteTeamRouter.post(
+  '/profiles/:profileId/accept',
+  instituteTeamController.acceptJoin,
+);
+instituteTeamRouter.post(
+  '/profiles/:profileId/reject',
+  instituteTeamController.rejectJoin,
+);
+instituteTeamRouter.post(
+  '/profiles/:profileId/leave/decide',
+  instituteTeamController.decideLeave,
+);
+instituteTeamRouter.post(
+  '/profiles/:profileId/resign/decide',
+  instituteTeamController.decideResign,
+);
+instituteTeamRouter.post(
+  '/profiles/:profileId/fire',
+  instituteTeamController.fireMember,
+);
+instituteTeamRouter.post(
+  '/profiles/:profileId/release',
+  instituteTeamController.releaseNotice,
 );
 instituteTeamRouter.patch(
   '/:memberId',

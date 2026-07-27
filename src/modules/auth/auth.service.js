@@ -3,7 +3,6 @@
 const { AppError } = require('../../common/errors/AppError');
 const { HTTP_STATUS } = require('../../common/constants/httpStatus');
 const { logger } = require('../../common/utils/logger');
-const { signAccessToken } = require('../../common/utils/jwt');
 const {
   generateOtpCode,
   hashOtp,
@@ -23,8 +22,67 @@ const {
   APP_ROLES,
   VERIFICATION_LEVEL_ON_INVITE_ACTIVATE,
   REJECTION_FIELDS_BY_ROLE,
+  EXAM_GOAL_CODES,
 } = require('./auth.constants');
 const { toPublicUploadPath } = require('./auth.upload');
+const {
+  EducatorProfile,
+  EDUCATOR_PROFILE_TYPES,
+  EDUCATOR_PROFILE_STATUSES,
+} = require('../educator-profile/educator-profile.model');
+const {
+  attachEducatorSession,
+  signUserAccessToken,
+} = require('../educator-profile/educator-collab.service');
+const { ensureInstituteCode } = require('../educator-profile/institute-code.util');
+const { mailService } = require('../../common/mail/mail.service');
+
+const ALL_EXAM_GOAL_CODES = new Set(EXAM_GOAL_CODES);
+
+function roleLabel(role) {
+  if (role === APP_ROLES.EDUCATOR) return 'freelancer educator';
+  if (role === APP_ROLES.DEFENCE_OFFICER) return 'defence officer';
+  if (role === APP_ROLES.INSTITUTE) return 'institute';
+  return role;
+}
+
+/**
+ * Normalizes examGoals from multipart JSON / CSV / array.
+ * @param {unknown} input
+ * @returns {string[]}
+ */
+function sanitizeExamGoals(input) {
+  let list = input;
+
+  if (typeof input === 'string') {
+    const trimmed = input.trim();
+    if (!trimmed) {
+      return [];
+    }
+    try {
+      const parsed = JSON.parse(trimmed);
+      list = Array.isArray(parsed) ? parsed : trimmed.split(',');
+    } catch {
+      list = trimmed.split(',');
+    }
+  }
+
+  if (!Array.isArray(list)) {
+    return [];
+  }
+
+  const unique = new Set();
+  for (const code of list) {
+    const value = String(code || '')
+      .trim()
+      .toLowerCase();
+    if (ALL_EXAM_GOAL_CODES.has(value)) {
+      unique.add(value);
+    }
+  }
+
+  return [...unique];
+}
 
 const BLOCKED_LOGIN_STATUSES = new Set([
   ACCOUNT_STATUS.SUSPENDED,
@@ -101,6 +159,7 @@ function toPublicUser(userDoc) {
     instituteLogoPath: json.instituteLogoPath || undefined,
     officerPhotoPath: json.officerPhotoPath || undefined,
     officerIdDocumentPath: json.officerIdDocumentPath || undefined,
+    idDocumentPath: json.idDocumentPath || undefined,
     rejectionReason: json.rejectionReason || undefined,
     rejectedFields: Array.isArray(json.rejectedFields)
       ? json.rejectedFields
@@ -116,6 +175,10 @@ function toPublicUser(userDoc) {
       ? String(json.invitedByUserId)
       : undefined,
     permissions: json.permissions || [],
+    instituteCode: json.instituteCode || undefined,
+    activeProfileId: json.activeProfileId
+      ? String(json.activeProfileId)
+      : undefined,
     createdAt: json.createdAt,
     lastLoginAt: json.lastLoginAt,
   };
@@ -126,7 +189,7 @@ function toPublicUser(userDoc) {
  */
 function buildAuthResult(user) {
   return {
-    accessToken: signAccessToken(user),
+    accessToken: signUserAccessToken(user),
     user,
   };
 }
@@ -181,9 +244,20 @@ class AuthService {
 
     if (!role) {
       throw new AppError(
-        'Invalid join type. Use aspirant, institute, or defence_officer.',
+        'Invalid join type. Use aspirant, institute, defence_officer, or educator.',
         HTTP_STATUS.BAD_REQUEST,
         { code: 'INVALID_JOIN_TYPE' },
+      );
+    }
+
+    if (
+      role === APP_ROLES.EDUCATOR &&
+      !config.features.educatorFreelancerRegister
+    ) {
+      throw new AppError(
+        'Freelancer educator registration is temporarily unavailable.',
+        HTTP_STATUS.FORBIDDEN,
+        { code: 'FEATURE_DISABLED' },
       );
     }
 
@@ -292,11 +366,94 @@ class AuthService {
       profile.officerIdDocumentPath = toPublicUploadPath(idFile);
     }
 
+    if (role === APP_ROLES.EDUCATOR) {
+      const fullName = String(body.fullName || '').trim();
+      const examGoals = sanitizeExamGoals(body.examGoals);
+      const photoFile = files.profilePhoto?.[0];
+      const idFile = files.idDocument?.[0];
+
+      if (fullName.length < 2) {
+        throw new AppError('Full name is required.', HTTP_STATUS.BAD_REQUEST, {
+          code: 'INVALID_FULL_NAME',
+        });
+      }
+
+      if (examGoals.length === 0) {
+        throw new AppError(
+          'Select at least one exam you prepare students for.',
+          HTTP_STATUS.BAD_REQUEST,
+          { code: 'EXAM_GOALS_REQUIRED' },
+        );
+      }
+
+      if (!photoFile) {
+        throw new AppError(
+          'Profile photo is required.',
+          HTTP_STATUS.BAD_REQUEST,
+          { code: 'MISSING_PROFILE_PHOTO' },
+        );
+      }
+
+      if (!idFile) {
+        throw new AppError(
+          'ID document is required for educator verification.',
+          HTTP_STATUS.BAD_REQUEST,
+          { code: 'MISSING_ID_DOCUMENT' },
+        );
+      }
+
+      const profilePhotoPath = toPublicUploadPath(photoFile);
+      const idDocumentPath = toPublicUploadPath(idFile);
+
+      profile.fullName = fullName;
+      profile.examGoals = examGoals;
+      profile.profilePhotoPath = profilePhotoPath;
+      profile.idDocumentPath = idDocumentPath;
+
+      const user = await User.create(profile);
+
+      await EducatorProfile.create({
+        userId: user._id,
+        type: EDUCATOR_PROFILE_TYPES.FREELANCER,
+        instituteId: null,
+        status: EDUCATOR_PROFILE_STATUSES.PENDING_VERIFICATION,
+        permissions: [],
+        displayName: fullName,
+        examGoals,
+        profilePhotoPath,
+        idDocumentPath,
+      });
+
+      const otpPayload = await issueOtpChallenge({
+        mobileNumber,
+        purpose: OTP_PURPOSE.REGISTER,
+      });
+
+      void mailService.notifyRegistrationReceived({
+        to: email,
+        name: fullName,
+        roleLabel: roleLabel(role),
+      });
+
+      return {
+        ...otpPayload,
+        joinType,
+        message: 'Account created. Verify OTP to continue.',
+      };
+    }
+
     await User.create(profile);
 
     const otpPayload = await issueOtpChallenge({
       mobileNumber,
       purpose: OTP_PURPOSE.REGISTER,
+    });
+
+    void mailService.notifyRegistrationReceived({
+      to: email,
+      name:
+        String(profile.fullName || profile.instituteName || '').trim() || 'there',
+      roleLabel: roleLabel(role),
     });
 
     return {
@@ -449,7 +606,7 @@ class AuthService {
 
     assertAccountCanLogin(user.accountStatus);
 
-    const publicUser = toPublicUser(user);
+    let publicUser = toPublicUser(user);
 
     // * Team members inherit institute branding from the owner account.
     if (user.instituteId && !publicUser.instituteLogoPath) {
@@ -464,6 +621,13 @@ class AuthService {
           publicUser.instituteName = owner.instituteName;
         }
       }
+    }
+
+    publicUser = await attachEducatorSession(user, publicUser);
+
+    if (user.role === APP_ROLES.INSTITUTE && user.accountStatus === ACCOUNT_STATUS.ACTIVE) {
+      const code = await ensureInstituteCode(user);
+      publicUser.instituteCode = code;
     }
 
     return publicUser;
@@ -488,10 +652,22 @@ class AuthService {
 
     if (
       user.role !== APP_ROLES.INSTITUTE &&
-      user.role !== APP_ROLES.DEFENCE_OFFICER
+      user.role !== APP_ROLES.DEFENCE_OFFICER &&
+      user.role !== APP_ROLES.EDUCATOR
     ) {
       throw new AppError(
-        'Only institute and defence officer applications can be resubmitted.',
+        'Only institute, defence officer, and freelancer educator applications can be resubmitted.',
+        HTTP_STATUS.BAD_REQUEST,
+        { code: 'NOT_RESUBMIT_CANDIDATE' },
+      );
+    }
+
+    if (
+      user.role === APP_ROLES.EDUCATOR &&
+      user.instituteId
+    ) {
+      throw new AppError(
+        'Institute faculty cannot resubmit via this path.',
         HTTP_STATUS.BAD_REQUEST,
         { code: 'NOT_RESUBMIT_CANDIDATE' },
       );
@@ -617,6 +793,42 @@ class AuthService {
       user.officerIdDocumentPath = toPublicUploadPath(idDoc);
     }
 
+    if (flaggedSet.has('examGoals')) {
+      const examGoals = sanitizeExamGoals(body.examGoals);
+      if (examGoals.length === 0) {
+        throw new AppError(
+          'Select at least one exam you prepare students for.',
+          HTTP_STATUS.BAD_REQUEST,
+          { code: 'EXAM_GOALS_REQUIRED' },
+        );
+      }
+      user.examGoals = examGoals;
+    }
+
+    if (flaggedSet.has('profilePhoto')) {
+      const photo = files.profilePhoto?.[0];
+      if (!photo) {
+        throw new AppError(
+          'Please upload a new profile photo.',
+          HTTP_STATUS.BAD_REQUEST,
+          { code: 'MISSING_PROFILE_PHOTO' },
+        );
+      }
+      user.profilePhotoPath = toPublicUploadPath(photo);
+    }
+
+    if (flaggedSet.has('idDocument')) {
+      const idDoc = files.idDocument?.[0];
+      if (!idDoc) {
+        throw new AppError(
+          'Please upload a new ID document.',
+          HTTP_STATUS.BAD_REQUEST,
+          { code: 'MISSING_ID_DOCUMENT' },
+        );
+      }
+      user.idDocumentPath = toPublicUploadPath(idDoc);
+    }
+
     user.accountStatus = ACCOUNT_STATUS.PENDING_VERIFICATION;
     // * Keep last rejection as context for admin + applicant while pending again.
     user.previousRejectionReason = String(user.rejectionReason || '').trim();
@@ -628,6 +840,39 @@ class AuthService {
     user.reviewedAt = null;
     user.reviewedByAdminId = null;
     await user.save();
+
+    if (user.role === APP_ROLES.EDUCATOR && !user.instituteId) {
+      const freelancerProfile = await EducatorProfile.findOne({
+        userId: user._id,
+        type: EDUCATOR_PROFILE_TYPES.FREELANCER,
+        status: { $ne: EDUCATOR_PROFILE_STATUSES.DELETED },
+      });
+
+      if (freelancerProfile) {
+        if (flaggedSet.has('fullName')) {
+          freelancerProfile.displayName = user.fullName;
+        }
+        if (flaggedSet.has('examGoals')) {
+          freelancerProfile.examGoals = [...(user.examGoals || [])];
+        }
+        if (flaggedSet.has('profilePhoto')) {
+          freelancerProfile.profilePhotoPath = user.profilePhotoPath || '';
+        }
+        if (flaggedSet.has('idDocument')) {
+          freelancerProfile.idDocumentPath = user.idDocumentPath || '';
+        }
+        freelancerProfile.status = EDUCATOR_PROFILE_STATUSES.PENDING_VERIFICATION;
+        freelancerProfile.previousRejectionReason = user.previousRejectionReason;
+        freelancerProfile.previousRejectedFields = [...user.previousRejectedFields];
+        freelancerProfile.resubmittedAt = user.resubmittedAt;
+        freelancerProfile.resubmissionCount = user.resubmissionCount;
+        freelancerProfile.rejectionReason = '';
+        freelancerProfile.rejectedFields = [];
+        freelancerProfile.reviewedAt = null;
+        freelancerProfile.reviewedByAdminId = null;
+        await freelancerProfile.save();
+      }
+    }
 
     return toPublicUser(user);
   }
@@ -669,7 +914,36 @@ class AuthService {
     user.lastLoginAt = new Date();
     await user.save();
 
-    const publicUser = toPublicUser(user);
+    if (
+      user.role === APP_ROLES.EDUCATOR &&
+      user.instituteId &&
+      user.accountStatus === ACCOUNT_STATUS.ACTIVE
+    ) {
+      await EducatorProfile.updateOne(
+        {
+          userId: user._id,
+          type: EDUCATOR_PROFILE_TYPES.INSTITUTE,
+          instituteId: user.instituteId,
+          status: EDUCATOR_PROFILE_STATUSES.INVITED,
+        },
+        {
+          $set: {
+            status: EDUCATOR_PROFILE_STATUSES.ACTIVE,
+            activatedAt: new Date(),
+            permissions: Array.isArray(user.permissions)
+              ? [...user.permissions]
+              : [],
+            joinSource: 'legacy_invite',
+          },
+        },
+      );
+    }
+
+    if (user.role === APP_ROLES.INSTITUTE && user.accountStatus === ACCOUNT_STATUS.ACTIVE) {
+      await ensureInstituteCode(user);
+    }
+
+    let publicUser = toPublicUser(user);
 
     if (user.instituteId && !publicUser.instituteLogoPath) {
       const owner = await User.findById(user.instituteId).select(
@@ -685,6 +959,7 @@ class AuthService {
       }
     }
 
+    publicUser = await attachEducatorSession(user, publicUser);
     return buildAuthResult(publicUser);
   }
 }

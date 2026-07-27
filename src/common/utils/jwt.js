@@ -14,6 +14,7 @@ const { HTTP_STATUS } = require('../constants/httpStatus');
  *   accountStatus: string,
  *   mobileNumber?: string,
  *   loginId?: string,
+ *   activeProfileId?: string,
  * }} subject
  * @returns {string}
  */
@@ -32,6 +33,10 @@ function signAccessToken(subject) {
 
   if (subject.loginId) {
     payload.loginId = subject.loginId;
+  }
+
+  if (subject.activeProfileId) {
+    payload.activeProfileId = subject.activeProfileId;
   }
 
   return jwt.sign(payload, config.jwt.secret, {
