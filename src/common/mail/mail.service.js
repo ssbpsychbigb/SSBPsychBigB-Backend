@@ -49,21 +49,48 @@ function sendTemplate(to, subject, templateInput, meta) {
 }
 
 const mailService = {
-  notifyRegistrationReceived({ to, name, roleLabel }) {
+  notifyRegistrationReceived({ to, name, roleLabel, otp }) {
+    const bullets = [
+      'Your mobile OTP still controls sign-in.',
+      'Our team will review your application and email you once approved or rejected.',
+    ];
+
+    if (otp) {
+      bullets.unshift(`Your verification OTP is ${otp}. It expires shortly.`);
+    }
+
     return sendTemplate(
       to,
-      'BIGB application received',
+      otp ? 'BIGB verification OTP' : 'BIGB application received',
       {
-        title: 'Application received',
+        title: otp ? 'Verify your BIGB account' : 'Application received',
         intro: `Hi ${name || 'there'}, we received your ${roleLabel} application on BIGB.`,
-        bullets: [
-          'Your mobile OTP still controls sign-in.',
-          'Our team will review your application and email you once approved or rejected.',
-        ],
+        bullets,
         ctaLabel: 'Open BIGB',
         ctaUrl: loginUrl('/login'),
       },
       { event: 'registration_received' },
+    );
+  },
+
+  notifyOtpCode({ to, name, otp, purpose }) {
+    const purposeLabel =
+      purpose === 'register' ? 'account verification' : 'sign-in';
+    return sendTemplate(
+      to,
+      'BIGB verification OTP',
+      {
+        title: 'Your BIGB OTP',
+        intro: `Hi ${name || 'there'}, use this one-time password for ${purposeLabel}.`,
+        bullets: [
+          `OTP: ${otp}`,
+          'Do not share this code with anyone.',
+          'It expires shortly. Request a new one if needed.',
+        ],
+        ctaLabel: 'Open BIGB',
+        ctaUrl: loginUrl('/login'),
+      },
+      { event: 'otp_email' },
     );
   },
 

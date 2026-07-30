@@ -223,6 +223,8 @@ async function issueOtpChallenge({ mobileNumber, purpose }) {
     mobileNumber,
     purpose,
     expiresIn: config.otp.ttlSeconds,
+    /** Server-only — strip before API response. */
+    otp,
     ...(config.otp.exposeInResponse ? { debugOtp: otp } : {}),
   };
 }
@@ -332,15 +334,25 @@ class AuthService {
 
     if (role === APP_ROLES.INSTITUTE) {
       const instituteName = String(body.instituteName || '').trim();
+      const logoFile = files.instituteLogo?.[0];
+
       if (instituteName.length < 2) {
         throw new AppError('Institute name is required.', HTTP_STATUS.BAD_REQUEST, {
           code: 'INVALID_INSTITUTE_NAME',
         });
       }
 
+      if (!logoFile || !logoFile.size) {
+        throw new AppError(
+          'Institute logo is required.',
+          HTTP_STATUS.BAD_REQUEST,
+          { code: 'MISSING_INSTITUTE_LOGO' },
+        );
+      }
+
       profile.fullName = instituteName;
       profile.instituteName = instituteName;
-      profile.instituteLogoPath = toPublicUploadPath(files.instituteLogo?.[0]);
+      profile.instituteLogoPath = toPublicUploadPath(logoFile);
     }
 
     if (role === APP_ROLES.DEFENCE_OFFICER) {
@@ -429,16 +441,22 @@ class AuthService {
         purpose: OTP_PURPOSE.REGISTER,
       });
 
-      void mailService.notifyRegistrationReceived({
+      const mailResult = await mailService.notifyRegistrationReceived({
         to: email,
         name: fullName,
         roleLabel: roleLabel(role),
+        otp: otpPayload.otp,
       });
 
+      const { otp: _otp, ...clientOtp } = otpPayload;
+
       return {
-        ...otpPayload,
+        ...clientOtp,
         joinType,
-        message: 'Account created. Verify OTP to continue.',
+        emailSent: Boolean(mailResult?.sent),
+        message: mailResult?.sent
+          ? 'Account created. Check your email for the OTP.'
+          : 'Account created. Verify OTP to continue.',
       };
     }
 
@@ -449,17 +467,23 @@ class AuthService {
       purpose: OTP_PURPOSE.REGISTER,
     });
 
-    void mailService.notifyRegistrationReceived({
+    const mailResult = await mailService.notifyRegistrationReceived({
       to: email,
       name:
         String(profile.fullName || profile.instituteName || '').trim() || 'there',
       roleLabel: roleLabel(role),
+      otp: otpPayload.otp,
     });
 
+    const { otp: _otp, ...clientOtp } = otpPayload;
+
     return {
-      ...otpPayload,
+      ...clientOtp,
       joinType,
-      message: 'Account created. Verify OTP to continue.',
+      emailSent: Boolean(mailResult?.sent),
+      message: mailResult?.sent
+        ? 'Account created. Check your email for the OTP.'
+        : 'Account created. Verify OTP to continue.',
     };
   }
 
@@ -496,10 +520,30 @@ class AuthService {
 
     assertAccountCanLogin(user.accountStatus);
 
-    return issueOtpChallenge({
+    const otpPayload = await issueOtpChallenge({
       mobileNumber,
       purpose,
     });
+
+    let emailSent = false;
+    if (user.email) {
+      const mailResult = await mailService.notifyOtpCode({
+        to: user.email,
+        name: user.fullName || user.instituteName || 'there',
+        otp: otpPayload.otp,
+        purpose,
+      });
+      emailSent = Boolean(mailResult?.sent);
+    }
+
+    const { otp: _otp, ...clientOtp } = otpPayload;
+    return {
+      ...clientOtp,
+      emailSent,
+      message: emailSent
+        ? 'OTP sent to your registered email.'
+        : 'OTP generated. Check the app for the code while SMS is offline.',
+    };
   }
 
   /**

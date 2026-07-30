@@ -7,7 +7,7 @@ const config = require('../../config');
 const { AppError } = require('../../common/errors/AppError');
 const { HTTP_STATUS } = require('../../common/constants/httpStatus');
 
-const uploadRoot = path.resolve(process.cwd(), config.upload.dir);
+const uploadRoot = path.resolve(__dirname, '../../..', config.upload.dir);
 
 if (!fs.existsSync(uploadRoot)) {
   fs.mkdirSync(uploadRoot, { recursive: true });
@@ -19,10 +19,11 @@ const storage = multer.diskStorage({
   },
   filename(_req, file, cb) {
     const safeBase = path
-      .basename(file.originalname)
+      .basename(file.originalname || 'upload.bin')
       .replace(/[^a-zA-Z0-9._-]/g, '_');
     const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-    cb(null, `${unique}-${safeBase}`);
+    const withExt = /\.[a-z0-9]+$/i.test(safeBase) ? safeBase : `${safeBase}.bin`;
+    cb(null, `${unique}-${withExt}`);
   },
 });
 
@@ -32,6 +33,12 @@ const storage = multer.diskStorage({
  * @param {multer.FileFilterCallback} cb
  */
 function fileFilter(_req, file, cb) {
+  const raw = String(file.mimetype || '')
+    .trim()
+    .toLowerCase();
+  const normalized =
+    raw === 'image/jpg' || raw === 'image/pjpeg' ? 'image/jpeg' : raw;
+
   const allowed = new Set([
     'image/jpeg',
     'image/png',
@@ -39,7 +46,7 @@ function fileFilter(_req, file, cb) {
     'application/pdf',
   ]);
 
-  if (!allowed.has(file.mimetype)) {
+  if (!allowed.has(normalized)) {
     cb(
       new AppError(
         'Only JPEG, PNG, WebP, or PDF files are allowed',
@@ -50,6 +57,8 @@ function fileFilter(_req, file, cb) {
     return;
   }
 
+  // * Keep multer metadata aligned with what we accept.
+  file.mimetype = normalized;
   cb(null, true);
 }
 
@@ -78,6 +87,10 @@ const teamProfileUpload = multer({
  */
 function toPublicUploadPath(file) {
   if (!file) {
+    return '';
+  }
+
+  if (!file.size || Number(file.size) <= 0) {
     return '';
   }
 
