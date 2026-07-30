@@ -183,6 +183,34 @@ const educatorProfileSchema = new mongoose.Schema(
       default: '',
       trim: true,
     },
+    /**
+     * Independent leave requests (pending / approved / …).
+     * Multiple fresh requests are allowed; update only while pending.
+     */
+    leaveRequests: {
+      type: [
+        {
+          reason: { type: String, default: '', trim: true },
+          startsAt: { type: Date, required: true },
+          endsAt: { type: Date, required: true },
+          requestedAt: { type: Date, default: Date.now },
+          decidedAt: { type: Date, default: null },
+          decisionNote: { type: String, default: '', trim: true },
+          status: {
+            type: String,
+            enum: [
+              'pending',
+              'approved',
+              'rejected',
+              'cancelled',
+              'completed',
+            ],
+            default: 'pending',
+          },
+        },
+      ],
+      default: [],
+    },
     resignReason: {
       type: String,
       default: '',

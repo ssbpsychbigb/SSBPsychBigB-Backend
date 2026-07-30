@@ -171,6 +171,8 @@ class AuthController {
       reason: req.body.reason,
       leaveStartsAt: req.body.leaveStartsAt,
       leaveEndsAt: req.body.leaveEndsAt,
+      leaveRequestId: req.body.leaveRequestId,
+      updatePending: Boolean(req.body.updatePending),
     });
     const institute = await User.findById(profile.instituteId).select(
       'instituteName fullName instituteLogoPath instituteCode',
@@ -190,6 +192,7 @@ class AuthController {
     const profile = await educatorHrService.cancelLeaveRequest({
       userId: req.auth.sub,
       profileId: req.params.profileId,
+      leaveRequestId: req.body?.leaveRequestId,
     });
     const institute = await User.findById(profile.instituteId).select(
       'instituteName fullName instituteLogoPath instituteCode',

@@ -212,6 +212,7 @@ function toProfileTeamMember(profile, memberUser, institute) {
     leaveStartsAt: summary.leaveStartsAt,
     leaveEndsAt: summary.leaveEndsAt,
     leaveRequestedAt: summary.leaveRequestedAt,
+    leaveRequests: summary.leaveRequests,
     resignReason: summary.resignReason,
     resignRequestedAt: summary.resignRequestedAt,
     noticeStartedAt: summary.noticeStartedAt,
@@ -1194,7 +1195,13 @@ class InstituteTeamService {
   /**
    * @param {{ profileId: string, decision: 'accept'|'reject', note?: string, actor: import('mongoose').Document }} input
    */
-  async decideLeaveRequest({ profileId, decision, note, actor }) {
+  async decideLeaveRequest({
+    profileId,
+    decision,
+    note,
+    actor,
+    leaveRequestId,
+  }) {
     const instituteId = resolveActorInstituteId(actor);
     const profile = await educatorHrService.decideLeave({
       actor,
@@ -1202,6 +1209,7 @@ class InstituteTeamService {
       profileId,
       decision,
       note,
+      leaveRequestId,
     });
     const memberUser = await User.findById(profile.userId);
     const owner = await User.findById(instituteId).select(

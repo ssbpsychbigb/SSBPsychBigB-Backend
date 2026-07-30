@@ -34,8 +34,28 @@ function rethrowReasonError(error) {
   throw error;
 }
 
+const LEAVE_REQ = {
+  PENDING: 'pending',
+  APPROVED: 'approved',
+  REJECTED: 'rejected',
+  CANCELLED: 'cancelled',
+  COMPLETED: 'completed',
+};
+
+/** Statuses that leave workflow must not override. */
+const LEAVE_STATUS_LOCKED = new Set([
+  EDUCATOR_PROFILE_STATUSES.RESIGN_PENDING,
+  EDUCATOR_PROFILE_STATUSES.NOTICE_PERIOD,
+  EDUCATOR_PROFILE_STATUSES.ENDED,
+  EDUCATOR_PROFILE_STATUSES.SUSPENDED,
+  EDUCATOR_PROFILE_STATUSES.REJECTED,
+  EDUCATOR_PROFILE_STATUSES.PENDING_VERIFICATION,
+  EDUCATOR_PROFILE_STATUSES.INVITED,
+  EDUCATOR_PROFILE_STATUSES.PENDING_ACCEPTANCE,
+]);
+
 /**
- * Clears leave workflow fields after cancel/reject/end.
+ * Clears legacy scalar leave mirror fields.
  * @param {import('mongoose').Document} profile
  */
 function clearLeaveFields(profile) {
@@ -45,6 +65,166 @@ function clearLeaveFields(profile) {
   profile.leaveRequestedAt = null;
   profile.leaveDecidedAt = null;
   profile.leaveDecisionNote = '';
+}
+
+/**
+ * Migrates old scalar leave fields into leaveRequests once.
+ * @param {import('mongoose').Document} profile
+ */
+function ensureLeaveRequestsMigrated(profile) {
+  if (!Array.isArray(profile.leaveRequests)) {
+    profile.leaveRequests = [];
+  }
+  if (profile.leaveRequests.length > 0) {
+    return;
+  }
+  if (!profile.leaveStartsAt || !profile.leaveEndsAt) {
+    return;
+  }
+  if (profile.status === EDUCATOR_PROFILE_STATUSES.LEAVE_PENDING) {
+    profile.leaveRequests.push({
+      reason: profile.leaveReason || '',
+      startsAt: profile.leaveStartsAt,
+      endsAt: profile.leaveEndsAt,
+      requestedAt: profile.leaveRequestedAt || new Date(),
+      decidedAt: null,
+      decisionNote: '',
+      status: LEAVE_REQ.PENDING,
+    });
+    return;
+  }
+  if (profile.status === EDUCATOR_PROFILE_STATUSES.ON_LEAVE) {
+    profile.leaveRequests.push({
+      reason: profile.leaveReason || '',
+      startsAt: profile.leaveStartsAt,
+      endsAt: profile.leaveEndsAt,
+      requestedAt: profile.leaveRequestedAt || new Date(),
+      decidedAt: profile.leaveDecidedAt || null,
+      decisionNote: profile.leaveDecisionNote || '',
+      status: LEAVE_REQ.APPROVED,
+    });
+  }
+}
+
+/**
+ * Marks expired approved leaves completed and mirrors legacy scalars.
+ * @param {import('mongoose').Document} profile
+ */
+function syncLeaveRequestsAndLegacy(profile) {
+  ensureLeaveRequestsMigrated(profile);
+  const now = Date.now();
+  for (const req of profile.leaveRequests) {
+    if (
+      req.status === LEAVE_REQ.APPROVED &&
+      req.endsAt &&
+      req.endsAt.getTime() <= now
+    ) {
+      req.status = LEAVE_REQ.COMPLETED;
+    }
+  }
+
+  const pending = profile.leaveRequests.filter(
+    (r) => r.status === LEAVE_REQ.PENDING,
+  );
+  const liveApproved = profile.leaveRequests
+    .filter(
+      (r) =>
+        r.status === LEAVE_REQ.APPROVED &&
+        r.endsAt &&
+        r.endsAt.getTime() > now,
+    )
+    .sort((a, b) => a.startsAt.getTime() - b.startsAt.getTime());
+  const activeApproved = liveApproved.find(
+    (r) => r.startsAt && r.startsAt.getTime() <= now,
+  );
+  const upcomingApproved = liveApproved.find(
+    (r) => r.startsAt && r.startsAt.getTime() > now,
+  );
+
+  const mirror = activeApproved || pending[0] || upcomingApproved || null;
+  if (!mirror) {
+    clearLeaveFields(profile);
+    return {
+      hasPending: pending.length > 0,
+      hasApprovedLeave: false,
+    };
+  }
+
+  profile.leaveReason = mirror.reason || '';
+  profile.leaveStartsAt = mirror.startsAt;
+  profile.leaveEndsAt = mirror.endsAt;
+  profile.leaveRequestedAt = mirror.requestedAt || null;
+  profile.leaveDecidedAt = mirror.decidedAt || null;
+  profile.leaveDecisionNote = mirror.decisionNote || '';
+  return {
+    hasPending: pending.length > 0,
+    // * Approved leave (current or upcoming) keeps collab in on_leave.
+    hasApprovedLeave: liveApproved.length > 0,
+  };
+}
+
+/**
+ * Sets collab status from leaveRequests (active / leave_pending / on_leave).
+ * @param {import('mongoose').Document} profile
+ */
+function reconcileLeaveCollabStatus(profile) {
+  if (LEAVE_STATUS_LOCKED.has(profile.status)) {
+    syncLeaveRequestsAndLegacy(profile);
+    return;
+  }
+  const { hasPending, hasApprovedLeave } = syncLeaveRequestsAndLegacy(profile);
+  // * Approved leave wins over pending for profile.status display;
+  // * pending rows still exist in leaveRequests for institute review.
+  if (hasApprovedLeave) {
+    profile.status = EDUCATOR_PROFILE_STATUSES.ON_LEAVE;
+    return;
+  }
+  if (hasPending) {
+    profile.status = EDUCATOR_PROFILE_STATUSES.LEAVE_PENDING;
+    return;
+  }
+  if (
+    profile.status === EDUCATOR_PROFILE_STATUSES.ON_LEAVE ||
+    profile.status === EDUCATOR_PROFILE_STATUSES.LEAVE_PENDING
+  ) {
+    profile.status = EDUCATOR_PROFILE_STATUSES.ACTIVE;
+  }
+}
+
+/**
+ * @param {import('mongoose').Document} profile
+ * @param {string|undefined} leaveRequestId
+ * @param {string} status
+ */
+function findLeaveRequest(profile, leaveRequestId, status) {
+  ensureLeaveRequestsMigrated(profile);
+  const list = profile.leaveRequests.filter((r) => r.status === status);
+  if (leaveRequestId) {
+    const found = list.find((r) => String(r._id) === String(leaveRequestId));
+    if (!found) {
+      throw new AppError(
+        'Leave request not found.',
+        HTTP_STATUS.NOT_FOUND,
+        { code: 'LEAVE_NOT_FOUND' },
+      );
+    }
+    return found;
+  }
+  if (list.length === 1) {
+    return list[0];
+  }
+  if (list.length === 0) {
+    throw new AppError(
+      'Leave request not found.',
+      HTTP_STATUS.NOT_FOUND,
+      { code: 'LEAVE_NOT_FOUND' },
+    );
+  }
+  throw new AppError(
+    'Multiple leave requests found. Pass leaveRequestId.',
+    HTTP_STATUS.BAD_REQUEST,
+    { code: 'LEAVE_REQUEST_ID_REQUIRED' },
+  );
 }
 
 /**
@@ -99,19 +279,13 @@ async function syncProfileLifecycle(profile) {
     return profile;
   }
 
-  const now = new Date();
-
-  if (
-    profile.status === EDUCATOR_PROFILE_STATUSES.ON_LEAVE &&
-    profile.leaveEndsAt &&
-    profile.leaveEndsAt.getTime() <= now.getTime()
-  ) {
-    profile.status = EDUCATOR_PROFILE_STATUSES.ACTIVE;
-    clearLeaveFields(profile);
+  const beforeStatus = profile.status;
+  reconcileLeaveCollabStatus(profile);
+  if (profile.status !== beforeStatus || profile.isModified()) {
     await profile.save();
-    return profile;
   }
 
+  const now = new Date();
   if (
     profile.status === EDUCATOR_PROFILE_STATUSES.NOTICE_PERIOD &&
     profile.noticeEndsAt &&
@@ -168,13 +342,15 @@ function assertCanDecideHr(actor) {
  */
 class EducatorHrService {
   /**
-   * Educator requests temporary leave (not permanent exit).
+   * Educator creates a fresh leave request, or updates one pending request.
+   * Approved leave is never overwritten — pass leaveRequestId only to edit pending.
    * @param {{
    *   userId: string,
    *   profileId: string,
    *   reason: string,
    *   leaveStartsAt: string,
    *   leaveEndsAt: string,
+   *   leaveRequestId?: string,
    * }} input
    */
   async requestLeave({
@@ -183,6 +359,8 @@ class EducatorHrService {
     reason,
     leaveStartsAt,
     leaveEndsAt,
+    leaveRequestId,
+    updatePending,
   }) {
     let leaveReason;
     let startsAt;
@@ -225,23 +403,49 @@ class EducatorHrService {
     }
 
     await syncProfileLifecycle(profile);
+    ensureLeaveRequestsMigrated(profile);
 
-    if (profile.status !== EDUCATOR_PROFILE_STATUSES.ACTIVE) {
+    const canRequest =
+      profile.status === EDUCATOR_PROFILE_STATUSES.ACTIVE ||
+      profile.status === EDUCATOR_PROFILE_STATUSES.LEAVE_PENDING ||
+      profile.status === EDUCATOR_PROFILE_STATUSES.ON_LEAVE;
+
+    if (!canRequest) {
       throw new AppError(
-        'Leave can only be requested while you are an active faculty member.',
+        'Leave can only be requested while active, on leave, or with a pending leave request.',
         HTTP_STATUS.BAD_REQUEST,
         { code: 'LEAVE_NOT_ALLOWED' },
       );
     }
 
-    profile.previousStatus = EDUCATOR_PROFILE_STATUSES.ACTIVE;
-    profile.status = EDUCATOR_PROFILE_STATUSES.LEAVE_PENDING;
-    profile.leaveReason = leaveReason;
-    profile.leaveStartsAt = startsAt;
-    profile.leaveEndsAt = endsAt;
-    profile.leaveRequestedAt = new Date();
-    profile.leaveDecidedAt = null;
-    profile.leaveDecisionNote = '';
+    if (leaveRequestId || updatePending) {
+      // * Update only an existing pending request — never approved leave.
+      const pending = findLeaveRequest(
+        profile,
+        leaveRequestId || undefined,
+        LEAVE_REQ.PENDING,
+      );
+      pending.reason = leaveReason;
+      pending.startsAt = startsAt;
+      pending.endsAt = endsAt;
+      pending.requestedAt = new Date();
+      pending.decidedAt = null;
+      pending.decisionNote = '';
+    } else {
+      // * Always create a fresh pending request (e.g. Aug 1 and Aug 3 separately).
+      profile.leaveRequests.push({
+        reason: leaveReason,
+        startsAt,
+        endsAt,
+        requestedAt: new Date(),
+        decidedAt: null,
+        decisionNote: '',
+        status: LEAVE_REQ.PENDING,
+      });
+    }
+
+    reconcileLeaveCollabStatus(profile);
+    profile.markModified('leaveRequests');
     await profile.save();
     const educator = await User.findById(userId).select('fullName');
     const institute = await User.findById(profile.instituteId).select(
@@ -260,26 +464,31 @@ class EducatorHrService {
 
   /**
    * Educator cancels a pending leave request.
-   * @param {{ userId: string, profileId: string }} input
+   * @param {{ userId: string, profileId: string, leaveRequestId?: string }} input
    */
-  async cancelLeaveRequest({ userId, profileId }) {
+  async cancelLeaveRequest({ userId, profileId, leaveRequestId }) {
     const profile = await EducatorProfile.findOne({
       _id: profileId,
       userId,
       type: EDUCATOR_PROFILE_TYPES.INSTITUTE,
-      status: EDUCATOR_PROFILE_STATUSES.LEAVE_PENDING,
     });
     if (!profile) {
-      throw new AppError(
-        'Pending leave request not found.',
-        HTTP_STATUS.NOT_FOUND,
-        { code: 'LEAVE_NOT_FOUND' },
-      );
+      throw new AppError('Collaboration not found.', HTTP_STATUS.NOT_FOUND, {
+        code: 'COLLAB_NOT_FOUND',
+      });
     }
 
-    profile.status = EDUCATOR_PROFILE_STATUSES.ACTIVE;
-    profile.previousStatus = '';
-    clearLeaveFields(profile);
+    ensureLeaveRequestsMigrated(profile);
+    const pending = findLeaveRequest(
+      profile,
+      leaveRequestId,
+      LEAVE_REQ.PENDING,
+    );
+    pending.status = LEAVE_REQ.CANCELLED;
+    pending.decidedAt = new Date();
+    pending.decisionNote = 'Cancelled by educator.';
+    reconcileLeaveCollabStatus(profile);
+    profile.markModified('leaveRequests');
     await profile.save();
     return profile;
   }
@@ -309,20 +518,36 @@ class EducatorHrService {
 
     await syncProfileLifecycle(profile);
 
-    if (
-      profile.status !== EDUCATOR_PROFILE_STATUSES.ACTIVE &&
-      profile.status !== EDUCATOR_PROFILE_STATUSES.ON_LEAVE
-    ) {
+    const canResign =
+      profile.status === EDUCATOR_PROFILE_STATUSES.ACTIVE ||
+      profile.status === EDUCATOR_PROFILE_STATUSES.ON_LEAVE ||
+      profile.status === EDUCATOR_PROFILE_STATUSES.LEAVE_PENDING;
+
+    if (!canResign) {
       throw new AppError(
-        profile.status === EDUCATOR_PROFILE_STATUSES.LEAVE_PENDING
-          ? 'Cancel your leave request before resigning.'
-          : 'Resign can only be requested while active or on leave.',
+        'Resign can only be requested while active, on leave, or with a pending leave request.',
         HTTP_STATUS.BAD_REQUEST,
         { code: 'RESIGN_NOT_ALLOWED' },
       );
     }
 
-    profile.previousStatus = profile.status;
+    // * Resign cancels any pending leave requests; approved leave may remain in history.
+    ensureLeaveRequestsMigrated(profile);
+    for (const row of profile.leaveRequests) {
+      if (row.status === LEAVE_REQ.PENDING) {
+        row.status = LEAVE_REQ.CANCELLED;
+        row.decidedAt = new Date();
+        row.decisionNote = 'Cancelled because resign was requested.';
+      }
+    }
+    syncLeaveRequestsAndLegacy(profile);
+    profile.markModified('leaveRequests');
+
+    profile.previousStatus =
+      profile.status === EDUCATOR_PROFILE_STATUSES.ON_LEAVE
+        ? EDUCATOR_PROFILE_STATUSES.ON_LEAVE
+        : EDUCATOR_PROFILE_STATUSES.ACTIVE;
+
     profile.status = EDUCATOR_PROFILE_STATUSES.RESIGN_PENDING;
     profile.resignReason = resignReason;
     profile.resignRequestedAt = new Date();
@@ -371,6 +596,7 @@ class EducatorHrService {
     profile.status = restore;
     profile.previousStatus = '';
     clearResignPendingFields(profile);
+    reconcileLeaveCollabStatus(profile);
     await profile.save();
     return profile;
   }
@@ -383,16 +609,23 @@ class EducatorHrService {
    *   profileId: string,
    *   decision: 'accept' | 'reject',
    *   note?: string,
+   *   leaveRequestId?: string,
    * }} input
    */
-  async decideLeave({ actor, instituteId, profileId, decision, note }) {
+  async decideLeave({
+    actor,
+    instituteId,
+    profileId,
+    decision,
+    note,
+    leaveRequestId,
+  }) {
     assertCanDecideHr(actor);
 
     const profile = await EducatorProfile.findOne({
       _id: profileId,
       type: EDUCATOR_PROFILE_TYPES.INSTITUTE,
       instituteId,
-      status: EDUCATOR_PROFILE_STATUSES.LEAVE_PENDING,
     });
     if (!profile) {
       throw new AppError(
@@ -402,16 +635,20 @@ class EducatorHrService {
       );
     }
 
+    ensureLeaveRequestsMigrated(profile);
+    const pending = findLeaveRequest(
+      profile,
+      leaveRequestId,
+      LEAVE_REQ.PENDING,
+    );
     const decisionNote = String(note || '').trim().slice(0, 500);
-    profile.leaveDecidedAt = new Date();
-    profile.leaveDecisionNote = decisionNote;
 
     if (decision === 'reject') {
-      profile.status = EDUCATOR_PROFILE_STATUSES.ACTIVE;
-      profile.previousStatus = '';
-      clearLeaveFields(profile);
-      profile.leaveDecidedAt = new Date();
-      profile.leaveDecisionNote = decisionNote || 'Leave request rejected.';
+      pending.status = LEAVE_REQ.REJECTED;
+      pending.decidedAt = new Date();
+      pending.decisionNote = decisionNote || 'Leave request rejected.';
+      reconcileLeaveCollabStatus(profile);
+      profile.markModified('leaveRequests');
       await profile.save();
       const educator = await User.findById(profile.userId).select('email');
       const institute = await User.findById(instituteId).select(
@@ -432,8 +669,11 @@ class EducatorHrService {
       });
     }
 
-    profile.status = EDUCATOR_PROFILE_STATUSES.ON_LEAVE;
-    profile.previousStatus = '';
+    pending.status = LEAVE_REQ.APPROVED;
+    pending.decidedAt = new Date();
+    pending.decisionNote = decisionNote;
+    reconcileLeaveCollabStatus(profile);
+    profile.markModified('leaveRequests');
     await profile.save();
     const educator = await User.findById(profile.userId).select('email');
     const institute = await User.findById(instituteId).select(

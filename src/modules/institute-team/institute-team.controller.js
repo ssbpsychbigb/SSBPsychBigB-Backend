@@ -148,6 +148,7 @@ class InstituteTeamController {
       profileId: req.params.profileId,
       decision: req.body.decision,
       note: req.body.note,
+      leaveRequestId: req.body.leaveRequestId,
       actor: req.appUser,
     });
     return ApiResponse.success(res, {

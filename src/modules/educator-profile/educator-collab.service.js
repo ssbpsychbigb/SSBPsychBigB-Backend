@@ -52,6 +52,26 @@ function toProfileSummary(profile, institute = null) {
     leaveStartsAt: json.leaveStartsAt || undefined,
     leaveEndsAt: json.leaveEndsAt || undefined,
     leaveRequestedAt: json.leaveRequestedAt || undefined,
+    leaveRequests: Array.isArray(json.leaveRequests)
+      ? json.leaveRequests
+          .map((row) => {
+            const id = row.id || row._id;
+            if (!id) {
+              return null;
+            }
+            return {
+              id: String(id),
+              reason: row.reason || undefined,
+              startsAt: row.startsAt || undefined,
+              endsAt: row.endsAt || undefined,
+              requestedAt: row.requestedAt || undefined,
+              decidedAt: row.decidedAt || undefined,
+              decisionNote: row.decisionNote || undefined,
+              status: row.status,
+            };
+          })
+          .filter(Boolean)
+      : [],
     resignReason: json.resignReason || undefined,
     resignRequestedAt: json.resignRequestedAt || undefined,
     noticeStartedAt: json.noticeStartedAt || undefined,
