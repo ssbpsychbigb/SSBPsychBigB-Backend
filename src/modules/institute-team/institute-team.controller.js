@@ -23,6 +23,70 @@ class InstituteTeamController {
   });
 
   /**
+   * GET /institute/team/roles
+   */
+  listRoles = asyncHandler(async (req, res) => {
+    const data = await instituteTeamService.listCustomRoles({
+      actor: req.appUser,
+    });
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Institute custom roles',
+      data,
+    });
+  });
+
+  /**
+   * POST /institute/team/roles
+   */
+  createRole = asyncHandler(async (req, res) => {
+    const data = await instituteTeamService.createCustomRole({
+      actor: req.appUser,
+      name: req.body.name,
+      description: req.body.description,
+      permissions: req.body.permissions,
+    });
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.CREATED,
+      message: 'Custom role created',
+      data,
+    });
+  });
+
+  /**
+   * PATCH /institute/team/roles/:roleId
+   */
+  updateRole = asyncHandler(async (req, res) => {
+    const data = await instituteTeamService.updateCustomRole({
+      actor: req.appUser,
+      roleId: req.params.roleId,
+      name: req.body.name,
+      description: req.body.description,
+      permissions: req.body.permissions,
+    });
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Custom role updated',
+      data,
+    });
+  });
+
+  /**
+   * DELETE /institute/team/roles/:roleId
+   */
+  deleteRole = asyncHandler(async (req, res) => {
+    const data = await instituteTeamService.deleteCustomRole({
+      actor: req.appUser,
+      roleId: req.params.roleId,
+    });
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Custom role deleted',
+      data,
+    });
+  });
+
+  /**
    * GET /institute/team
    */
   list = asyncHandler(async (req, res) => {
@@ -47,6 +111,7 @@ class InstituteTeamController {
       mobileNumber: req.body.mobileNumber,
       role: req.body.role,
       permissions: req.body.permissions,
+      customRoleId: req.body.customRoleId,
       examGoals: req.body.examGoals,
       profilePhotoPath: profilePhotoPath || undefined,
       actor: req.appUser,
@@ -100,6 +165,7 @@ class InstituteTeamController {
       actor: req.appUser,
       freelancerUserId: req.body.userId,
       permissions: req.body.permissions,
+      customRoleId: req.body.customRoleId,
       examGoals: req.body.examGoals,
     });
     return ApiResponse.success(res, {
@@ -231,6 +297,9 @@ class InstituteTeamController {
     }
     if (req.body.permissions !== undefined) {
       payload.permissions = req.body.permissions;
+    }
+    if (req.body.customRoleId !== undefined) {
+      payload.customRoleId = req.body.customRoleId;
     }
     if (req.body.examGoals !== undefined) {
       payload.examGoals = req.body.examGoals;

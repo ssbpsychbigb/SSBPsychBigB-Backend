@@ -5,12 +5,20 @@ const { ACCOUNT_STATUS } = require('../auth/auth.constants');
 const { OPEN_COLLAB_STATUSES } = require('./educator-hr.constants');
 
 /**
- * One educator brand/context per document.
- * Freelancer = personal brand; institute = faculty membership under one institute.
+ * One brand/context per document.
+ * Freelancer = personal educator brand; personal = learner home profile;
+ * institute = staff membership under one institute.
  */
 const EDUCATOR_PROFILE_TYPES = Object.freeze({
   FREELANCER: 'freelancer',
+  PERSONAL: 'personal',
   INSTITUTE: 'institute',
+});
+
+/** Staff role carried on an institute membership profile (permissions still authoritative). */
+const INSTITUTE_STAFF_ROLES = Object.freeze({
+  EDUCATOR: 'educator',
+  INSTITUTE_ADMIN: 'institute_admin',
 });
 
 const EDUCATOR_PROFILE_STATUSES = Object.freeze({
@@ -67,6 +75,21 @@ const educatorProfileSchema = new mongoose.Schema(
     permissions: {
       type: [String],
       default: [],
+    },
+    /**
+     * Account-type intent for institute membership (Admin vs Educator).
+     * Permissions remain the access source of truth.
+     */
+    staffRole: {
+      type: String,
+      enum: [...Object.values(INSTITUTE_STAFF_ROLES), ''],
+      default: '',
+    },
+    /** Optional institute custom role template for this membership. */
+    customRoleId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'InstituteRole',
+      default: null,
     },
     displayName: {
       type: String,
@@ -311,5 +334,6 @@ module.exports = {
   EducatorProfile,
   EDUCATOR_PROFILE_TYPES,
   EDUCATOR_PROFILE_STATUSES,
+  INSTITUTE_STAFF_ROLES,
   EXIT_ENDED_BY,
 };

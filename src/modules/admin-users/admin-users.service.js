@@ -3,7 +3,7 @@
 const { AppError } = require('../../common/errors/AppError');
 const { HTTP_STATUS } = require('../../common/constants/httpStatus');
 const { User } = require('../auth/user.model');
-const { APP_ROLES, ACCOUNT_STATUS } = require('../auth/auth.constants');
+const { APP_ROLES, ACCOUNT_STATUS, isLearnerRole } = require('../auth/auth.constants');
 
 /**
  * @param {import('mongoose').Document} userDoc
@@ -48,6 +48,7 @@ class AdminUsersService {
     const filter = {
       role: {
         $in: [
+          APP_ROLES.USER,
           APP_ROLES.ASPIRANT,
           APP_ROLES.INSTITUTE,
           APP_ROLES.INSTITUTE_ADMIN,
@@ -58,8 +59,9 @@ class AdminUsersService {
       accountStatus: { $ne: ACCOUNT_STATUS.DELETED },
     };
 
-    if (
-      role === APP_ROLES.ASPIRANT ||
+    if (role === APP_ROLES.USER || role === 'users' || role === APP_ROLES.ASPIRANT) {
+      filter.role = { $in: [APP_ROLES.USER, APP_ROLES.ASPIRANT] };
+    } else if (
       role === APP_ROLES.INSTITUTE ||
       role === APP_ROLES.INSTITUTE_ADMIN ||
       role === APP_ROLES.EDUCATOR ||
@@ -103,7 +105,7 @@ class AdminUsersService {
     }
 
     if (
-      user.role !== APP_ROLES.ASPIRANT &&
+      !isLearnerRole(user.role) &&
       user.role !== APP_ROLES.INSTITUTE &&
       user.role !== APP_ROLES.DEFENCE_OFFICER
     ) {

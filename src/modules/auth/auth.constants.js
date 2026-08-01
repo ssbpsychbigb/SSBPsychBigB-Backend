@@ -5,12 +5,26 @@
  */
 
 const APP_ROLES = Object.freeze({
+  /** Primary learner / consumer identity (replaces Student product language). */
+  USER: 'user',
+  /** @deprecated Legacy learner role — still readable; new registers use `user`. */
   ASPIRANT: 'aspirant',
   INSTITUTE: 'institute',
   INSTITUTE_ADMIN: 'institute_admin',
   EDUCATOR: 'educator',
   DEFENCE_OFFICER: 'defence_officer',
 });
+
+/** Learner account roles (learn profile + optional institute staff profiles). */
+const LEARNER_ROLES = Object.freeze([APP_ROLES.USER, APP_ROLES.ASPIRANT]);
+
+/**
+ * @param {string | undefined | null} role
+ * @returns {boolean}
+ */
+function isLearnerRole(role) {
+  return LEARNER_ROLES.includes(String(role || ''));
+}
 
 const ADMIN_ROLES = Object.freeze({
   SUPER_ADMIN: 'super_admin',
@@ -52,7 +66,10 @@ const PORTAL = Object.freeze({
 });
 
 const JOIN_TYPE_TO_ROLE = Object.freeze({
-  aspirant: APP_ROLES.ASPIRANT,
+  /** Preferred public register join type. */
+  user: APP_ROLES.USER,
+  /** Legacy alias — still accepted from older clients. */
+  aspirant: APP_ROLES.USER,
   institute: APP_ROLES.INSTITUTE,
   defence_officer: APP_ROLES.DEFENCE_OFFICER,
   /** Public Freelancer Educator apply path (not institute invite). */
@@ -430,6 +447,8 @@ const REJECTION_FIELD_LABELS = Object.freeze({
 
 module.exports = {
   APP_ROLES,
+  LEARNER_ROLES,
+  isLearnerRole,
   ADMIN_ROLES,
   ASSIGNABLE_ADMIN_ROLES,
   ASSIGNABLE_INSTITUTE_ROLES,

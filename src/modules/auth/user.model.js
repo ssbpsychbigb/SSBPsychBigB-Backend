@@ -135,6 +135,12 @@ const userSchema = new mongoose.Schema(
       type: [String],
       default: [],
     },
+    /** Optional institute custom role template applied to this member. */
+    customRoleId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'InstituteRole',
+      default: null,
+    },
     rejectionReason: {
       type: String,
       default: '',
