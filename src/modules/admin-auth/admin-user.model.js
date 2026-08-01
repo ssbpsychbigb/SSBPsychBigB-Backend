@@ -71,6 +71,12 @@ const adminUserSchema = new mongoose.Schema(
         return [...(ROLE_DEFAULT_PERMISSIONS[this.role] || [])];
       },
     },
+    /** Optional platform custom role template applied to this staff member. */
+    customRoleId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'AdminRole',
+      default: null,
+    },
     lastLoginAt: {
       type: Date,
     },

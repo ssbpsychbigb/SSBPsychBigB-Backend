@@ -27,6 +27,7 @@ function toPublicAdmin(adminDoc) {
     accountStatus: json.accountStatus,
     portal: json.portal,
     permissions: json.permissions || [],
+    customRoleId: json.customRoleId ? String(json.customRoleId) : undefined,
     lastLoginAt: json.lastLoginAt,
     createdAt: json.createdAt,
   };

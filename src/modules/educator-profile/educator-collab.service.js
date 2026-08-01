@@ -7,15 +7,20 @@ const {
   ACCOUNT_STATUS,
   APP_ROLES,
   ROLE_DEFAULT_PERMISSIONS,
+  isLearnerRole,
 } = require('../auth/auth.constants');
 const {
   EducatorProfile,
   EDUCATOR_PROFILE_TYPES,
   EDUCATOR_PROFILE_STATUSES,
+  INSTITUTE_STAFF_ROLES,
 } = require('./educator-profile.model');
 const { normalizeInstituteCode, ensureInstituteCode } = require('./institute-code.util');
 const { signAccessToken } = require('../../common/utils/jwt');
 const { mailService } = require('../../common/mail/mail.service');
+const {
+  InstituteRole,
+} = require('../institute-team/institute-role.model');
 const {
   syncProfileLifecycle,
   findOpenCollab,
@@ -26,8 +31,9 @@ const { OPEN_COLLAB_STATUSES } = require('./educator-hr.constants');
 /**
  * @param {import('mongoose').Document} profile
  * @param {import('mongoose').Document | null} institute
+ * @param {{ customRoleName?: string }} [extras]
  */
-function toProfileSummary(profile, institute = null) {
+function toProfileSummary(profile, institute = null, extras = {}) {
   const json = profile.toJSON();
   return {
     id: json.id,
@@ -39,6 +45,9 @@ function toProfileSummary(profile, institute = null) {
     instituteLogoPath: institute?.instituteLogoPath || undefined,
     instituteCode: institute?.instituteCode || undefined,
     permissions: Array.isArray(json.permissions) ? json.permissions : [],
+    staffRole: json.staffRole || undefined,
+    customRoleId: json.customRoleId ? String(json.customRoleId) : undefined,
+    customRoleName: extras.customRoleName || undefined,
     displayName: json.displayName || undefined,
     examGoals: Array.isArray(json.examGoals) ? json.examGoals : [],
     profilePhotoPath: json.profilePhotoPath || undefined,
@@ -48,6 +57,8 @@ function toProfileSummary(profile, institute = null) {
       : undefined,
     createdAt: json.createdAt,
     activatedAt: json.activatedAt || undefined,
+    rejectionReason: json.rejectionReason || undefined,
+    reviewedAt: json.reviewedAt || undefined,
     leaveReason: json.leaveReason || undefined,
     leaveStartsAt: json.leaveStartsAt || undefined,
     leaveEndsAt: json.leaveEndsAt || undefined,
@@ -105,7 +116,8 @@ async function listProfilesForUser(userId) {
   const liveProfiles = profiles.filter(
     (row) =>
       row.status !== EDUCATOR_PROFILE_STATUSES.DELETED &&
-      row.status !== EDUCATOR_PROFILE_STATUSES.ENDED,
+      row.status !== EDUCATOR_PROFILE_STATUSES.ENDED &&
+      row.status !== EDUCATOR_PROFILE_STATUSES.REJECTED,
   );
 
   const instituteIds = [
@@ -128,12 +140,35 @@ async function listProfilesForUser(userId) {
     }
   }
 
+  const customRoleIds = [
+    ...new Set(
+      liveProfiles
+        .filter((row) => row.customRoleId)
+        .map((row) => String(row.customRoleId)),
+    ),
+  ];
+  /** @type {Map<string, string>} */
+  const customRoleNameMap = new Map();
+  if (customRoleIds.length > 0) {
+    const roles = await InstituteRole.find({
+      _id: { $in: customRoleIds },
+    }).select('name');
+    for (const row of roles) {
+      customRoleNameMap.set(String(row._id), row.name);
+    }
+  }
+
   return liveProfiles.map((profile) =>
     toProfileSummary(
       profile,
       profile.instituteId
         ? instituteMap.get(String(profile.instituteId)) || null
         : null,
+      {
+        customRoleName: profile.customRoleId
+          ? customRoleNameMap.get(String(profile.customRoleId))
+          : undefined,
+      },
     ),
   );
 }
@@ -146,6 +181,15 @@ function resolveActiveProfileId(user, profiles) {
   const stored = user.activeProfileId ? String(user.activeProfileId) : '';
   if (stored && profiles.some((row) => row.id === stored)) {
     return stored;
+  }
+
+  const activePersonal = profiles.find(
+    (row) =>
+      row.type === EDUCATOR_PROFILE_TYPES.PERSONAL &&
+      row.status === EDUCATOR_PROFILE_STATUSES.ACTIVE,
+  );
+  if (activePersonal) {
+    return activePersonal.id;
   }
 
   const activeFreelancer = profiles.find(
@@ -170,25 +214,92 @@ function resolveActiveProfileId(user, profiles) {
 }
 
 /**
+ * Ensures a learner has a personal (learn-home) profile for multi-profile switch.
+ * @param {import('mongoose').Document} user
+ */
+async function ensurePersonalLearnerProfile(user) {
+  if (!isLearnerRole(user.role)) {
+    return null;
+  }
+
+  let personal = await EducatorProfile.findOne({
+    userId: user._id,
+    type: EDUCATOR_PROFILE_TYPES.PERSONAL,
+    status: { $ne: EDUCATOR_PROFILE_STATUSES.DELETED },
+  });
+
+  if (personal) {
+    return personal;
+  }
+
+  const examGoals = [];
+  if (user.examGoal) {
+    examGoals.push(String(user.examGoal));
+  }
+  if (Array.isArray(user.examGoals)) {
+    for (const code of user.examGoals) {
+      const value = String(code || '').trim();
+      if (value && !examGoals.includes(value)) {
+        examGoals.push(value);
+      }
+    }
+  }
+
+  personal = await EducatorProfile.create({
+    userId: user._id,
+    type: EDUCATOR_PROFILE_TYPES.PERSONAL,
+    status: EDUCATOR_PROFILE_STATUSES.ACTIVE,
+    displayName: user.fullName || '',
+    examGoals,
+    profilePhotoPath: user.profilePhotoPath || '',
+    activatedAt: new Date(),
+  });
+
+  return personal;
+}
+
+/**
  * @param {import('mongoose').Document} userDoc
  * @param {object} publicUser
  */
 async function attachEducatorSession(userDoc, publicUser) {
-  if (userDoc.role !== APP_ROLES.EDUCATOR && userDoc.role !== APP_ROLES.INSTITUTE) {
-    if (userDoc.role === APP_ROLES.INSTITUTE) {
-      publicUser.instituteCode = userDoc.instituteCode || undefined;
-    }
-    return publicUser;
-  }
-
   if (userDoc.role === APP_ROLES.INSTITUTE) {
     publicUser.instituteCode = userDoc.instituteCode || undefined;
     return publicUser;
   }
 
+  const canHaveProfiles =
+    userDoc.role === APP_ROLES.EDUCATOR || isLearnerRole(userDoc.role);
+
+  if (!canHaveProfiles) {
+    return publicUser;
+  }
+
+  if (isLearnerRole(userDoc.role)) {
+    const existingCount = await EducatorProfile.countDocuments({
+      userId: userDoc._id,
+      type: EDUCATOR_PROFILE_TYPES.INSTITUTE,
+      status: {
+        $nin: [
+          EDUCATOR_PROFILE_STATUSES.DELETED,
+          EDUCATOR_PROFILE_STATUSES.ENDED,
+        ],
+      },
+    });
+    // * Personal profile only needed once the user has institute memberships.
+    if (existingCount > 0) {
+      await ensurePersonalLearnerProfile(userDoc);
+    }
+  }
+
   const profiles = await listProfilesForUser(userDoc._id);
+  if (profiles.length === 0) {
+    return publicUser;
+  }
+
   const activeProfileId = resolveActiveProfileId(userDoc, profiles);
-  const activeProfile = profiles.find((row) => row.id === activeProfileId) || null;
+  const activeProfile =
+    profiles.find((row) => row.id === activeProfileId) || null;
 
   if (
     activeProfileId &&
@@ -215,6 +326,7 @@ async function attachEducatorSession(userDoc, publicUser) {
     publicUser.instituteId = activeProfile.instituteId;
     publicUser.instituteName = activeProfile.instituteName;
     publicUser.instituteLogoPath = activeProfile.instituteLogoPath;
+    publicUser.instituteCode = activeProfile.instituteCode;
     publicUser.permissions = activeProfile.permissions || [];
   }
 
@@ -426,29 +538,34 @@ class EducatorCollabService {
     profile.status = EDUCATOR_PROFILE_STATUSES.ACTIVE;
     profile.activatedAt = new Date();
     if (!profile.permissions?.length) {
-      profile.permissions = [
-        ...(ROLE_DEFAULT_PERMISSIONS[APP_ROLES.EDUCATOR] || []),
-      ];
+      const defaultsRole =
+        profile.staffRole === INSTITUTE_STAFF_ROLES.INSTITUTE_ADMIN
+          ? APP_ROLES.INSTITUTE_ADMIN
+          : APP_ROLES.EDUCATOR;
+      profile.permissions = [...(ROLE_DEFAULT_PERMISSIONS[defaultsRole] || [])];
     }
     await profile.save();
 
     const institute = await User.findById(profile.instituteId).select(
       'instituteName fullName instituteLogoPath instituteCode email',
     );
-    const educator = await User.findById(userId).select('fullName');
+    const member = await User.findById(userId);
+    if (member && isLearnerRole(member.role)) {
+      await ensurePersonalLearnerProfile(member);
+    }
     void mailService.notifyHireAccepted({
       to: institute?.email,
-      educatorName: educator?.fullName || 'An educator',
+      educatorName: member?.fullName || 'A member',
       instituteName: institute?.instituteName || institute?.fullName || 'Institute',
     });
     return toProfileSummary(profile, institute);
   }
 
   /**
-   * Freelancer declines a hire invite or cancels their own join request.
-   * @param {{ userId: string, profileId: string }} input
+   * Declines a hire invite (reason required) or cancels own join request.
+   * @param {{ userId: string, profileId: string, reason?: string }} input
    */
-  async declineOrCancelCollab({ userId, profileId }) {
+  async declineOrCancelCollab({ userId, profileId, reason }) {
     const profile = await EducatorProfile.findOne({
       _id: profileId,
       userId,
@@ -462,20 +579,50 @@ class EducatorCollabService {
       });
     }
 
-    profile.status = EDUCATOR_PROFILE_STATUSES.DELETED;
-    await profile.save();
+    const {
+      normalizeReason,
+      requireReason,
+    } = require('./educator-hr.constants');
+
     if (profile.joinSource === 'institute_hire') {
+      let note;
+      try {
+        note = requireReason(reason, 'Decline reason');
+      } catch (error) {
+        throw new AppError(
+          error.message || 'Enter a decline reason (at least 10 characters).',
+          HTTP_STATUS.BAD_REQUEST,
+          { code: error.code || 'REASON_REQUIRED' },
+        );
+      }
+
+      profile.status = EDUCATOR_PROFILE_STATUSES.REJECTED;
+      profile.rejectionReason = note;
+      profile.reviewedAt = new Date();
+      await profile.save();
+
       const institute = await User.findById(profile.instituteId).select(
-        'instituteName fullName email',
+        'instituteName fullName email instituteLogoPath instituteCode',
       );
-      const educator = await User.findById(userId).select('fullName');
+      const member = await User.findById(userId).select('fullName');
       void mailService.notifyHireDeclined({
         to: institute?.email,
-        educatorName: educator?.fullName || 'An educator',
+        educatorName: member?.fullName || 'A member',
         instituteName:
           institute?.instituteName || institute?.fullName || 'Institute',
       });
+
+      return toProfileSummary(profile, institute);
     }
+
+    // * Own join-request cancel — remove from institute queue.
+    profile.status = EDUCATOR_PROFILE_STATUSES.DELETED;
+    const note = normalizeReason(reason);
+    if (note) {
+      profile.rejectionReason = note;
+      profile.reviewedAt = new Date();
+    }
+    await profile.save();
     return { id: String(profile._id), deleted: true };
   }
 
@@ -489,11 +636,14 @@ class EducatorCollabService {
    */
   async switchProfile({ userId, profileId, toPublicUser }) {
     const user = await User.findById(userId);
-    if (!user || user.role !== APP_ROLES.EDUCATOR) {
+    if (
+      !user ||
+      (user.role !== APP_ROLES.EDUCATOR && !isLearnerRole(user.role))
+    ) {
       throw new AppError(
-        'Only educators can switch profiles.',
+        'Only users with multiple profiles can switch.',
         HTTP_STATUS.FORBIDDEN,
-        { code: 'NOT_EDUCATOR' },
+        { code: 'PROFILE_SWITCH_FORBIDDEN' },
       );
     }
 
@@ -508,10 +658,26 @@ class EducatorCollabService {
     const profile = await EducatorProfile.findOne({
       _id: profileId,
       userId: user._id,
-      status: { $in: [...ENTERABLE_COLLAB_STATUSES] },
+      status: {
+        $in: [
+          EDUCATOR_PROFILE_STATUSES.ACTIVE,
+          ...ENTERABLE_COLLAB_STATUSES,
+        ],
+      },
     });
 
     if (!profile) {
+      throw new AppError(
+        'Active profile not found.',
+        HTTP_STATUS.NOT_FOUND,
+        { code: 'PROFILE_NOT_FOUND' },
+      );
+    }
+
+    if (
+      profile.type === EDUCATOR_PROFILE_TYPES.INSTITUTE &&
+      !ENTERABLE_COLLAB_STATUSES.includes(profile.status)
+    ) {
       throw new AppError(
         'Active profile not found.',
         HTTP_STATUS.NOT_FOUND,
@@ -534,6 +700,7 @@ module.exports = {
   educatorCollabService: new EducatorCollabService(),
   listProfilesForUser,
   attachEducatorSession,
+  ensurePersonalLearnerProfile,
   toProfileSummary,
   signUserAccessToken,
   resolveActiveProfileId,

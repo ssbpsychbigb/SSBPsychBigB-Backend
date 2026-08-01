@@ -152,11 +152,12 @@ class AuthController {
     const data = await educatorCollabService.declineOrCancelCollab({
       userId: req.auth.sub,
       profileId: req.params.profileId,
+      reason: req.body.reason,
     });
 
     return ApiResponse.success(res, {
       statusCode: HTTP_STATUS.OK,
-      message: 'Collaboration cancelled',
+      message: 'Collaboration declined',
       data,
     });
   });
