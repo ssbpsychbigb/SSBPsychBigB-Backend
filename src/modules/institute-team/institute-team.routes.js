@@ -6,8 +6,13 @@ const {
   requireAppAuth,
   requireAppUser,
 } = require('../../common/middleware/requireAppAuth');
-const { APP_ROLES } = require('../auth/auth.constants');
+const {
+  APP_ROLES,
+} = require('../auth/auth.constants');
 const { teamProfileUpload } = require('../auth/auth.upload');
+const {
+  hydrateInstituteActorContext,
+} = require('./institute-team.service');
 
 /**
  * Institute team routes (app portal).
@@ -24,11 +29,35 @@ instituteTeamRouter.use(requireAppAuth);
 instituteTeamRouter.use(
   requireAppUser({
     requireActive: true,
-    roles: [APP_ROLES.INSTITUTE, APP_ROLES.INSTITUTE_ADMIN],
+    roles: [
+      APP_ROLES.INSTITUTE,
+      APP_ROLES.INSTITUTE_ADMIN,
+      APP_ROLES.EDUCATOR,
+      APP_ROLES.USER,
+      APP_ROLES.ASPIRANT,
+    ],
   }),
 );
+instituteTeamRouter.use(async (req, _res, next) => {
+  try {
+    await hydrateInstituteActorContext(req.appUser);
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+});
 
 instituteTeamRouter.get('/catalog', instituteTeamController.catalog);
+instituteTeamRouter.get('/roles', instituteTeamController.listRoles);
+instituteTeamRouter.post('/roles', instituteTeamController.createRole);
+instituteTeamRouter.patch(
+  '/roles/:roleId',
+  instituteTeamController.updateRole,
+);
+instituteTeamRouter.delete(
+  '/roles/:roleId',
+  instituteTeamController.deleteRole,
+);
 instituteTeamRouter.get('/code', instituteTeamController.instituteCode);
 instituteTeamRouter.get(
   '/freelancers',

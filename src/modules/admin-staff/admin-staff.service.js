@@ -17,6 +17,7 @@ const {
   ADMIN_PERMISSION_META,
   ROLE_DEFAULT_PERMISSIONS,
 } = require('../auth/auth.constants');
+const { AdminRole } = require('./admin-role.model');
 
 const ALL_PERMISSION_CODES = new Set(Object.values(ADMIN_PERMISSIONS));
 
@@ -38,6 +39,80 @@ function sanitizePermissions(input) {
   }
 
   return [...unique];
+}
+
+/**
+ * Staff never receive staff-manage (Super Admin only).
+ * @param {string[]} permissions
+ */
+function stripStaffManage(permissions) {
+  return permissions.filter((code) => code !== ADMIN_PERMISSIONS.STAFF_MANAGE);
+}
+
+/**
+ * @param {string|undefined|null} customRoleId
+ */
+async function loadAdminCustomRole(customRoleId) {
+  const id = String(customRoleId || '').trim();
+  if (!id) {
+    return null;
+  }
+  const role = await AdminRole.findOne({ _id: id, isDeleted: false });
+  if (!role) {
+    throw new AppError('Custom role not found.', HTTP_STATUS.NOT_FOUND, {
+      code: 'CUSTOM_ROLE_NOT_FOUND',
+    });
+  }
+  return role;
+}
+
+/**
+ * @param {{
+ *   role: string,
+ *   permissions?: unknown,
+ *   customRoleId?: string | null,
+ * }} input
+ */
+async function resolveAdminGrantBundle({ role, permissions, customRoleId }) {
+  const defaults = ROLE_DEFAULT_PERMISSIONS[role] || [];
+  const customRole = await loadAdminCustomRole(customRoleId);
+
+  if (customRole) {
+    const fromBody =
+      permissions === undefined ? undefined : sanitizePermissions(permissions);
+    return {
+      permissions: stripStaffManage(
+        fromBody === undefined
+          ? sanitizePermissions(customRole.permissions)
+          : fromBody,
+      ),
+      customRoleId: customRole._id,
+    };
+  }
+
+  return {
+    permissions: stripStaffManage(
+      permissions === undefined
+        ? [...defaults]
+        : sanitizePermissions(permissions),
+    ),
+    customRoleId: null,
+  };
+}
+
+/**
+ * @param {import('mongoose').Document} roleDoc
+ */
+function toAdminCustomRoleSummary(roleDoc) {
+  const json = roleDoc.toJSON();
+  return {
+    id: json.id,
+    name: json.name,
+    description: json.description || '',
+    permissions: Array.isArray(json.permissions) ? json.permissions : [],
+    createdAt: json.createdAt,
+    updatedAt: json.updatedAt,
+  };
 }
 
 /**
@@ -72,6 +147,173 @@ class AdminStaffService {
   }
 
   /**
+   * @param {{ actor: import('mongoose').Document }} input
+   */
+  async listCustomRoles({ actor }) {
+    if (actor.role !== ADMIN_ROLES.SUPER_ADMIN) {
+      throw new AppError(
+        'Only Super Admin can manage custom roles.',
+        HTTP_STATUS.FORBIDDEN,
+        { code: 'SUPER_ADMIN_ONLY' },
+      );
+    }
+
+    const rows = await AdminRole.find({ isDeleted: false })
+      .sort({ name: 1 })
+      .limit(200);
+    return rows.map(toAdminCustomRoleSummary);
+  }
+
+  /**
+   * @param {{
+   *   actor: import('mongoose').Document,
+   *   name: string,
+   *   description?: string,
+   *   permissions?: unknown,
+   * }} input
+   */
+  async createCustomRole({ actor, name, description, permissions }) {
+    if (actor.role !== ADMIN_ROLES.SUPER_ADMIN) {
+      throw new AppError(
+        'Only Super Admin can manage custom roles.',
+        HTTP_STATUS.FORBIDDEN,
+        { code: 'SUPER_ADMIN_ONLY' },
+      );
+    }
+
+    const nextName = String(name || '').trim();
+    if (!nextName || nextName.length < 2) {
+      throw new AppError('Enter a role name.', HTTP_STATUS.BAD_REQUEST, {
+        code: 'INVALID_ROLE_NAME',
+      });
+    }
+
+    const nextPermissions = stripStaffManage(
+      sanitizePermissions(permissions || []),
+    );
+    if (nextPermissions.length === 0) {
+      throw new AppError(
+        'Select at least one permission for this role.',
+        HTTP_STATUS.BAD_REQUEST,
+        { code: 'PERMISSIONS_REQUIRED' },
+      );
+    }
+
+    try {
+      const role = await AdminRole.create({
+        name: nextName,
+        description: String(description || '').trim().slice(0, 300),
+        permissions: nextPermissions,
+        createdByAdminId: actor._id,
+        isDeleted: false,
+      });
+      return toAdminCustomRoleSummary(role);
+    } catch (error) {
+      if (error && error.code === 11000) {
+        throw new AppError(
+          'A custom role with this name already exists.',
+          HTTP_STATUS.CONFLICT,
+          { code: 'CUSTOM_ROLE_DUPLICATE' },
+        );
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * @param {{
+   *   actor: import('mongoose').Document,
+   *   roleId: string,
+   *   name?: string,
+   *   description?: string,
+   *   permissions?: unknown,
+   * }} input
+   */
+  async updateCustomRole({
+    actor,
+    roleId,
+    name,
+    description,
+    permissions,
+  }) {
+    if (actor.role !== ADMIN_ROLES.SUPER_ADMIN) {
+      throw new AppError(
+        'Only Super Admin can manage custom roles.',
+        HTTP_STATUS.FORBIDDEN,
+        { code: 'SUPER_ADMIN_ONLY' },
+      );
+    }
+
+    const role = await loadAdminCustomRole(roleId);
+
+    if (name !== undefined) {
+      const nextName = String(name || '').trim();
+      if (!nextName || nextName.length < 2) {
+        throw new AppError('Enter a role name.', HTTP_STATUS.BAD_REQUEST, {
+          code: 'INVALID_ROLE_NAME',
+        });
+      }
+      role.name = nextName;
+    }
+
+    if (description !== undefined) {
+      role.description = String(description || '').trim().slice(0, 300);
+    }
+
+    if (permissions !== undefined) {
+      const nextPermissions = stripStaffManage(
+        sanitizePermissions(permissions || []),
+      );
+      if (nextPermissions.length === 0) {
+        throw new AppError(
+          'Select at least one permission for this role.',
+          HTTP_STATUS.BAD_REQUEST,
+          { code: 'PERMISSIONS_REQUIRED' },
+        );
+      }
+      role.permissions = nextPermissions;
+    }
+
+    try {
+      await role.save();
+      return toAdminCustomRoleSummary(role);
+    } catch (error) {
+      if (error && error.code === 11000) {
+        throw new AppError(
+          'A custom role with this name already exists.',
+          HTTP_STATUS.CONFLICT,
+          { code: 'CUSTOM_ROLE_DUPLICATE' },
+        );
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * @param {{ actor: import('mongoose').Document, roleId: string }} input
+   */
+  async deleteCustomRole({ actor, roleId }) {
+    if (actor.role !== ADMIN_ROLES.SUPER_ADMIN) {
+      throw new AppError(
+        'Only Super Admin can manage custom roles.',
+        HTTP_STATUS.FORBIDDEN,
+        { code: 'SUPER_ADMIN_ONLY' },
+      );
+    }
+
+    const role = await loadAdminCustomRole(roleId);
+    role.isDeleted = true;
+    await role.save();
+
+    await AdminUser.updateMany(
+      { customRoleId: role._id },
+      { $set: { customRoleId: null } },
+    );
+
+    return { id: String(role._id), deleted: true };
+  }
+
+  /**
    * Lists Platform Admin / Moderator only (never Super Admin seed accounts).
    */
   async listStaff() {
@@ -94,6 +336,7 @@ class AdminStaffService {
    *   password: string,
    *   role: string,
    *   permissions?: string[],
+   *   customRoleId?: string,
    *   actor: import('mongoose').Document,
    * }} input
    */
@@ -105,6 +348,7 @@ class AdminStaffService {
     password,
     role,
     permissions,
+    customRoleId,
     actor,
   }) {
     if (actor.role !== ADMIN_ROLES.SUPER_ADMIN) {
@@ -166,16 +410,11 @@ class AdminStaffService {
       );
     }
 
-    const defaults = ROLE_DEFAULT_PERMISSIONS[nextRole] || [];
-    const nextPermissions =
-      permissions === undefined
-        ? [...defaults]
-        : sanitizePermissions(permissions);
-
-    // * Staff cannot receive staff-manage unless Super Admin (never for PA/PM).
-    const safePermissions = nextPermissions.filter(
-      (code) => code !== ADMIN_PERMISSIONS.STAFF_MANAGE,
-    );
+    const grant = await resolveAdminGrantBundle({
+      role: nextRole,
+      permissions,
+      customRoleId,
+    });
 
     const passwordHash = await bcrypt.hash(rawPassword, 12);
 
@@ -188,7 +427,8 @@ class AdminStaffService {
         passwordHash,
         role: nextRole,
         accountStatus: ACCOUNT_STATUS.ACTIVE,
-        permissions: safePermissions,
+        permissions: grant.permissions,
+        customRoleId: grant.customRoleId,
       });
 
       return toPublicAdmin(admin);
@@ -210,6 +450,7 @@ class AdminStaffService {
    *   fullName?: string,
    *   mobileNumber?: string,
    *   permissions?: string[],
+   *   customRoleId?: string | null,
    *   accountStatus?: string,
    *   password?: string,
    *   actor: import('mongoose').Document,
@@ -220,6 +461,7 @@ class AdminStaffService {
     fullName,
     mobileNumber,
     permissions,
+    customRoleId,
     accountStatus,
     password,
     actor,
@@ -277,11 +519,29 @@ class AdminStaffService {
       staff.mobileNumber = normalizedMobile;
     }
 
-    if (permissions !== undefined) {
-      const next = sanitizePermissions(permissions).filter(
-        (code) => code !== ADMIN_PERMISSIONS.STAFF_MANAGE,
-      );
-      staff.permissions = next;
+    if (permissions !== undefined || customRoleId !== undefined) {
+      if (customRoleId === '' || customRoleId === null) {
+        staff.customRoleId = null;
+        if (permissions !== undefined) {
+          staff.permissions = stripStaffManage(
+            sanitizePermissions(permissions),
+          );
+        }
+      } else {
+        const grant = await resolveAdminGrantBundle({
+          role: staff.role,
+          permissions:
+            permissions !== undefined ? permissions : staff.permissions,
+          customRoleId:
+            customRoleId !== undefined
+              ? customRoleId
+              : staff.customRoleId
+                ? String(staff.customRoleId)
+                : undefined,
+        });
+        staff.permissions = grant.permissions;
+        staff.customRoleId = grant.customRoleId;
+      }
     }
 
     if (accountStatus !== undefined) {

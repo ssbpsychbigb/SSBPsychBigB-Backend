@@ -17,26 +17,67 @@ const {
   ROLE_DEFAULT_PERMISSIONS,
   PORTAL,
   EXAM_GOAL_CODES,
+  isLearnerRole,
 } = require('../auth/auth.constants');
 const {
   EducatorProfile,
   EDUCATOR_PROFILE_TYPES,
   EDUCATOR_PROFILE_STATUSES,
+  INSTITUTE_STAFF_ROLES,
 } = require('../educator-profile/educator-profile.model');
-const { toProfileSummary } = require('../educator-profile/educator-collab.service');
+const {
+  toProfileSummary,
+  ensurePersonalLearnerProfile,
+} = require('../educator-profile/educator-collab.service');
 const { ensureInstituteCode } = require('../educator-profile/institute-code.util');
 const {
   educatorHrService,
   syncProfileLifecycle,
   findOpenCollab,
   OPEN_COLLAB_STATUSES,
+  ENTERABLE_COLLAB_STATUSES,
 } = require('../educator-profile/educator-hr.service');
 const { mailService } = require('../../common/mail/mail.service');
+const { InstituteRole } = require('./institute-role.model');
 
 const ALL_INSTITUTE_PERMISSION_CODES = new Set(
   Object.values(INSTITUTE_PERMISSIONS),
 );
 const ALL_EXAM_GOAL_CODES = new Set(EXAM_GOAL_CODES);
+
+/**
+ * Loads active institute membership onto the mongoose actor for permission checks.
+ * Account role may stay `user` / `educator` while staff access lives on the profile.
+ * @param {import('mongoose').Document} actor
+ */
+async function hydrateInstituteActorContext(actor) {
+  if (!actor || actor.role === APP_ROLES.INSTITUTE) {
+    return actor;
+  }
+
+  if (!actor.activeProfileId) {
+    return actor;
+  }
+
+  const profile = await EducatorProfile.findOne({
+    _id: actor.activeProfileId,
+    userId: actor._id,
+    type: EDUCATOR_PROFILE_TYPES.INSTITUTE,
+    status: { $in: [...ENTERABLE_COLLAB_STATUSES] },
+  }).select('instituteId permissions staffRole customRoleId status');
+
+  if (!profile?.instituteId) {
+    return actor;
+  }
+
+  actor.instituteId = profile.instituteId;
+  actor.permissions = Array.isArray(profile.permissions)
+    ? [...profile.permissions]
+    : [];
+  actor._instituteStaffRole = profile.staffRole || '';
+  actor._hydratedInstituteProfile = true;
+  return actor;
+}
 
 /**
  * @param {unknown} input
@@ -118,6 +159,127 @@ function parsePermissionsField(input) {
 }
 
 /**
+ * Loads an active custom role owned by the institute.
+ * @param {string} instituteId
+ * @param {string|undefined|null} customRoleId
+ */
+async function loadInstituteCustomRole(instituteId, customRoleId) {
+  const id = String(customRoleId || '').trim();
+  if (!id) {
+    return null;
+  }
+
+  const role = await InstituteRole.findOne({
+    _id: id,
+    instituteId,
+    isDeleted: false,
+  });
+  if (!role) {
+    throw new AppError('Custom role not found.', HTTP_STATUS.NOT_FOUND, {
+      code: 'CUSTOM_ROLE_NOT_FOUND',
+    });
+  }
+  return role;
+}
+
+/**
+ * Resolves permissions (+ optional customRoleId) for invite / hire / update.
+ * @param {{
+ *   role: string,
+ *   permissions?: unknown,
+ *   customRoleId?: string,
+ *   actor: import('mongoose').Document,
+ *   instituteId: string,
+ * }} input
+ */
+async function resolveGrantBundle({
+  role,
+  permissions,
+  customRoleId,
+  actor,
+  instituteId,
+}) {
+  const defaults = ROLE_DEFAULT_PERMISSIONS[role] || [];
+  const canAssignRoles =
+    actor.role === APP_ROLES.INSTITUTE ||
+    resolveActorPermissions(actor).includes(
+      INSTITUTE_PERMISSIONS.ROLES_ASSIGN,
+    );
+
+  // * Explicit custom template on hire/invite — apply whenever the template exists.
+  const customRole = await loadInstituteCustomRole(instituteId, customRoleId);
+  if (customRole) {
+    if (!canAssignRoles) {
+      throw new AppError(
+        'You do not have permission to assign custom roles.',
+        HTTP_STATUS.FORBIDDEN,
+        { code: 'INSTITUTE_FORBIDDEN' },
+      );
+    }
+    const parsedPermissions = parsePermissionsField(permissions);
+    return {
+      permissions:
+        parsedPermissions === undefined
+          ? sanitizeInstitutePermissions(customRole.permissions)
+          : parsedPermissions.length > 0
+            ? parsedPermissions
+            : sanitizeInstitutePermissions(customRole.permissions),
+      customRoleId: customRole._id,
+    };
+  }
+
+  if (!canAssignRoles) {
+    return {
+      permissions: [...defaults],
+      customRoleId: null,
+    };
+  }
+
+  const parsedPermissions = parsePermissionsField(permissions);
+  return {
+    permissions:
+      parsedPermissions === undefined ? [...defaults] : parsedPermissions,
+    customRoleId: null,
+  };
+}
+
+/**
+ * @param {import('mongoose').Document} roleDoc
+ */
+function toCustomRoleSummary(roleDoc) {
+  const json = roleDoc.toJSON();
+  return {
+    id: json.id,
+    name: json.name,
+    description: json.description || '',
+    permissions: Array.isArray(json.permissions) ? json.permissions : [],
+    createdAt: json.createdAt,
+    updatedAt: json.updatedAt,
+  };
+}
+
+/**
+ * @param {import('mongoose').Document} actor
+ */
+function assertCanManageCustomRoles(actor) {
+  if (actor.role === APP_ROLES.INSTITUTE) {
+    return;
+  }
+  const perms = resolveActorPermissions(actor);
+  if (
+    perms.includes(INSTITUTE_PERMISSIONS.ROLES_ASSIGN) ||
+    perms.includes(INSTITUTE_PERMISSIONS.TEAM_MANAGE)
+  ) {
+    return;
+  }
+  throw new AppError(
+    'You do not have permission to manage custom roles.',
+    HTTP_STATUS.FORBIDDEN,
+    { code: 'INSTITUTE_FORBIDDEN' },
+  );
+}
+
+/**
  * @param {import('mongoose').Document} actor
  * @returns {string[]}
  */
@@ -138,12 +300,16 @@ function resolveActorInstituteId(actor) {
     return String(actor._id);
   }
 
-  if (
-    (actor.role === APP_ROLES.INSTITUTE_ADMIN ||
-      actor.role === APP_ROLES.EDUCATOR) &&
-    actor.instituteId
-  ) {
-    return String(actor.instituteId);
+  if (actor.instituteId) {
+    const allowedAccount =
+      actor.role === APP_ROLES.INSTITUTE_ADMIN ||
+      actor.role === APP_ROLES.EDUCATOR ||
+      isLearnerRole(actor.role) ||
+      Boolean(actor._hydratedInstituteProfile);
+
+    if (allowedAccount) {
+      return String(actor.instituteId);
+    }
   }
 
   throw new AppError(
@@ -174,14 +340,17 @@ function assertActorHasPermission(actor, permission) {
 
 /**
  * @param {import('mongoose').Document} member
+ * @param {{ customRoleName?: string }} [extras]
  */
-function toTeamMember(member) {
+function toTeamMember(member, extras = {}) {
   const user = toPublicUser(member);
   return {
     ...user,
     instituteId: user.instituteId,
     invitedByUserId: user.invitedByUserId,
     membershipKind: 'legacy',
+    customRoleId: user.customRoleId,
+    customRoleName: extras.customRoleName || undefined,
   };
 }
 
@@ -190,15 +359,22 @@ function toTeamMember(member) {
  * @param {import('mongoose').Document} profile
  * @param {import('mongoose').Document} memberUser
  * @param {import('mongoose').Document | null} institute
+ * @param {{ customRoleName?: string }} [extras]
  */
-function toProfileTeamMember(profile, memberUser, institute) {
-  const summary = toProfileSummary(profile, institute);
+function toProfileTeamMember(profile, memberUser, institute, extras = {}) {
+  const summary = toProfileSummary(profile, institute, {
+    customRoleName: extras.customRoleName,
+  });
   const user = toPublicUser(memberUser);
+  const staffRole =
+    summary.staffRole === INSTITUTE_STAFF_ROLES.INSTITUTE_ADMIN
+      ? APP_ROLES.INSTITUTE_ADMIN
+      : APP_ROLES.EDUCATOR;
   return {
     ...user,
     id: summary.id,
     userId: user.id,
-    role: APP_ROLES.EDUCATOR,
+    role: staffRole,
     accountStatus: summary.status,
     instituteId: summary.instituteId,
     permissions: summary.permissions,
@@ -207,7 +383,11 @@ function toProfileTeamMember(profile, memberUser, institute) {
     invitedByUserId: summary.invitedByUserId,
     joinSource: summary.joinSource,
     membershipKind: 'profile',
+    customRoleId: summary.customRoleId,
+    customRoleName: summary.customRoleName || extras.customRoleName || undefined,
     createdAt: summary.createdAt,
+    rejectionReason: summary.rejectionReason,
+    reviewedAt: summary.reviewedAt,
     leaveReason: summary.leaveReason,
     leaveStartsAt: summary.leaveStartsAt,
     leaveEndsAt: summary.leaveEndsAt,
@@ -222,6 +402,48 @@ function toProfileTeamMember(profile, memberUser, institute) {
     endedAt: summary.endedAt,
     endedBy: summary.endedBy,
   };
+}
+
+/**
+ * @param {Array<string|import('mongoose').Types.ObjectId|null|undefined>} ids
+ * @returns {Promise<Map<string, string>>}
+ */
+async function loadCustomRoleNameMap(ids) {
+  /** @type {Map<string, string>} */
+  const map = new Map();
+  const unique = [
+    ...new Set(
+      (ids || [])
+        .map((id) => String(id || '').trim())
+        .filter(Boolean),
+    ),
+  ];
+  if (unique.length === 0) {
+    return map;
+  }
+  const roles = await InstituteRole.find({ _id: { $in: unique } }).select(
+    'name',
+  );
+  for (const row of roles) {
+    map.set(String(row._id), row.name);
+  }
+  return map;
+}
+
+/**
+ * @param {import('mongoose').Document} profile
+ * @param {import('mongoose').Document} memberUser
+ * @param {import('mongoose').Document | null} institute
+ */
+async function toProfileTeamMemberResolved(profile, memberUser, institute) {
+  let customRoleName;
+  if (profile.customRoleId) {
+    const map = await loadCustomRoleNameMap([profile.customRoleId]);
+    customRoleName = map.get(String(profile.customRoleId));
+  }
+  return toProfileTeamMember(profile, memberUser, institute, {
+    customRoleName,
+  });
 }
 
 /**
@@ -253,18 +475,200 @@ class InstituteTeamService {
   }
 
   /**
+   * Lists custom roles for the actor's institute.
    * @param {{ actor: import('mongoose').Document }} input
    */
-  async listTeam({ actor }) {
+  async listCustomRoles({ actor }) {
     const instituteId = resolveActorInstituteId(actor);
 
-    if (actor.role === APP_ROLES.EDUCATOR) {
+    const canList =
+      actor.role === APP_ROLES.INSTITUTE ||
+      resolveActorPermissions(actor).includes(
+        INSTITUTE_PERMISSIONS.TEAM_MANAGE,
+      ) ||
+      resolveActorPermissions(actor).includes(
+        INSTITUTE_PERMISSIONS.FACULTY_ADD,
+      ) ||
+      resolveActorPermissions(actor).includes(
+        INSTITUTE_PERMISSIONS.ROLES_ASSIGN,
+      );
+
+    if (!canList) {
       throw new AppError(
-        'Educators cannot manage the institute team directory.',
+        'You do not have permission to view custom roles.',
         HTTP_STATUS.FORBIDDEN,
         { code: 'INSTITUTE_FORBIDDEN' },
       );
     }
+
+    const rows = await InstituteRole.find({
+      instituteId,
+      isDeleted: false,
+    })
+      .sort({ name: 1 })
+      .limit(200);
+
+    return rows.map(toCustomRoleSummary);
+  }
+
+  /**
+   * Creates an institute-scoped custom role template.
+   * @param {{
+   *   actor: import('mongoose').Document,
+   *   name: string,
+   *   description?: string,
+   *   permissions?: unknown,
+   * }} input
+   */
+  async createCustomRole({
+    actor,
+    name,
+    description,
+    permissions,
+  }) {
+    const instituteId = resolveActorInstituteId(actor);
+    assertCanManageCustomRoles(actor);
+
+    const nextName = String(name || '').trim();
+    if (!nextName || nextName.length < 2) {
+      throw new AppError('Enter a role name.', HTTP_STATUS.BAD_REQUEST, {
+        code: 'INVALID_ROLE_NAME',
+      });
+    }
+
+    const nextPermissions = sanitizeInstitutePermissions(
+      parsePermissionsField(permissions) || [],
+    );
+    if (nextPermissions.length === 0) {
+      throw new AppError(
+        'Select at least one permission for this role.',
+        HTTP_STATUS.BAD_REQUEST,
+        { code: 'PERMISSIONS_REQUIRED' },
+      );
+    }
+
+    try {
+      const role = await InstituteRole.create({
+        instituteId,
+        name: nextName,
+        description: String(description || '').trim().slice(0, 300),
+        baseRole: '',
+        permissions: nextPermissions,
+        createdByUserId: actor._id,
+        isDeleted: false,
+      });
+      return toCustomRoleSummary(role);
+    } catch (error) {
+      if (error && error.code === 11000) {
+        throw new AppError(
+          'A custom role with this name already exists.',
+          HTTP_STATUS.CONFLICT,
+          { code: 'CUSTOM_ROLE_DUPLICATE' },
+        );
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Updates an institute custom role template.
+   * @param {{
+   *   actor: import('mongoose').Document,
+   *   roleId: string,
+   *   name?: string,
+   *   description?: string,
+   *   permissions?: unknown,
+   * }} input
+   */
+  async updateCustomRole({
+    actor,
+    roleId,
+    name,
+    description,
+    permissions,
+  }) {
+    const instituteId = resolveActorInstituteId(actor);
+    assertCanManageCustomRoles(actor);
+
+    const role = await loadInstituteCustomRole(instituteId, roleId);
+
+    if (name !== undefined) {
+      const nextName = String(name || '').trim();
+      if (!nextName || nextName.length < 2) {
+        throw new AppError('Enter a role name.', HTTP_STATUS.BAD_REQUEST, {
+          code: 'INVALID_ROLE_NAME',
+        });
+      }
+      role.name = nextName;
+    }
+
+    if (description !== undefined) {
+      role.description = String(description || '').trim().slice(0, 300);
+    }
+
+    if (permissions !== undefined) {
+      const nextPermissions = sanitizeInstitutePermissions(
+        parsePermissionsField(permissions) || [],
+      );
+      if (nextPermissions.length === 0) {
+        throw new AppError(
+          'Select at least one permission for this role.',
+          HTTP_STATUS.BAD_REQUEST,
+          { code: 'PERMISSIONS_REQUIRED' },
+        );
+      }
+      role.permissions = nextPermissions;
+    }
+
+    // * Custom roles are permission packs only — clear legacy baseRole.
+    role.baseRole = '';
+
+    try {
+      await role.save();
+      return toCustomRoleSummary(role);
+    } catch (error) {
+      if (error && error.code === 11000) {
+        throw new AppError(
+          'A custom role with this name already exists.',
+          HTTP_STATUS.CONFLICT,
+          { code: 'CUSTOM_ROLE_DUPLICATE' },
+        );
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Soft-deletes a custom role. Staff keep their current permission snapshot.
+   * @param {{ actor: import('mongoose').Document, roleId: string }} input
+   */
+  async deleteCustomRole({ actor, roleId }) {
+    const instituteId = resolveActorInstituteId(actor);
+    assertCanManageCustomRoles(actor);
+
+    const role = await loadInstituteCustomRole(instituteId, roleId);
+    role.isDeleted = true;
+    await role.save();
+
+    // * Detach template pointer; keep expanded permissions on members.
+    await User.updateMany(
+      { instituteId, customRoleId: role._id },
+      { $set: { customRoleId: null } },
+    );
+    await EducatorProfile.updateMany(
+      { instituteId, customRoleId: role._id },
+      { $set: { customRoleId: null } },
+    );
+
+    return { id: String(role._id), deleted: true };
+  }
+
+  /**
+   * @param {{ actor: import('mongoose').Document }} input
+   */
+  async listTeam({ actor }) {
+    await hydrateInstituteActorContext(actor);
+    const instituteId = resolveActorInstituteId(actor);
 
     const canList =
       actor.role === APP_ROLES.INSTITUTE ||
@@ -291,7 +695,7 @@ class InstituteTeamService {
       .sort({ createdAt: -1 })
       .limit(300);
 
-    const legacy = members.map(toTeamMember);
+    const legacy = members.map((row) => toTeamMember(row));
     const legacyUserIds = new Set(legacy.map((row) => row.id));
 
     const collabProfiles = await EducatorProfile.find({
@@ -324,6 +728,19 @@ class InstituteTeamService {
       'instituteName fullName instituteLogoPath instituteCode',
     );
 
+    const customRoleNameMap = await loadCustomRoleNameMap([
+      ...liveCollabs.map((row) => row.customRoleId),
+      ...members.map((row) => row.customRoleId),
+    ]);
+
+    const legacyWithNames = members.map((row) =>
+      toTeamMember(row, {
+        customRoleName: row.customRoleId
+          ? customRoleNameMap.get(String(row.customRoleId))
+          : undefined,
+      }),
+    );
+
     const profileRows = [];
     for (const profile of liveCollabs) {
       const memberUser = userMap.get(String(profile.userId));
@@ -338,10 +755,57 @@ class InstituteTeamService {
       ) {
         continue;
       }
-      profileRows.push(toProfileTeamMember(profile, memberUser, owner));
+      profileRows.push(
+        toProfileTeamMember(profile, memberUser, owner, {
+          customRoleName: profile.customRoleId
+            ? customRoleNameMap.get(String(profile.customRoleId))
+            : undefined,
+        }),
+      );
     }
 
-    return [...profileRows, ...legacy];
+    // * Declined hire invites — visible to institute with reason + timestamp.
+    const declinedProfiles = await EducatorProfile.find({
+      type: EDUCATOR_PROFILE_TYPES.INSTITUTE,
+      instituteId,
+      status: EDUCATOR_PROFILE_STATUSES.REJECTED,
+      joinSource: 'institute_hire',
+    })
+      .sort({ reviewedAt: -1, updatedAt: -1 })
+      .limit(50);
+
+    const declinedUserIds = [
+      ...new Set(declinedProfiles.map((row) => String(row.userId))),
+    ];
+    const declinedUsers =
+      declinedUserIds.length > 0
+        ? await User.find({ _id: { $in: declinedUserIds } })
+        : [];
+    /** @type {Map<string, import('mongoose').Document>} */
+    const declinedUserMap = new Map(
+      declinedUsers.map((row) => [String(row._id), row]),
+    );
+
+    const declinedRoleMap = await loadCustomRoleNameMap(
+      declinedProfiles.map((row) => row.customRoleId),
+    );
+
+    const declinedRows = [];
+    for (const profile of declinedProfiles) {
+      const memberUser = declinedUserMap.get(String(profile.userId));
+      if (!memberUser) {
+        continue;
+      }
+      declinedRows.push(
+        toProfileTeamMember(profile, memberUser, owner, {
+          customRoleName: profile.customRoleId
+            ? declinedRoleMap.get(String(profile.customRoleId))
+            : undefined,
+        }),
+      );
+    }
+
+    return [...profileRows, ...legacyWithNames, ...declinedRows];
   }
 
   /**
@@ -362,6 +826,7 @@ class InstituteTeamService {
     mobileNumber,
     role,
     permissions,
+    customRoleId,
     examGoals,
     profilePhotoPath,
     actor,
@@ -374,14 +839,6 @@ class InstituteTeamService {
         'Role must be institute_admin or educator.',
         HTTP_STATUS.BAD_REQUEST,
         { code: 'INVALID_INSTITUTE_ROLE' },
-      );
-    }
-
-    if (actor.role === APP_ROLES.EDUCATOR) {
-      throw new AppError(
-        'Educators cannot invite institute team members.',
-        HTTP_STATUS.FORBIDDEN,
-        { code: 'INSTITUTE_FORBIDDEN' },
       );
     }
 
@@ -453,21 +910,15 @@ class InstituteTeamService {
       );
     }
 
-    const defaults = ROLE_DEFAULT_PERMISSIONS[nextRole] || [];
-    const parsedPermissions = parsePermissionsField(permissions);
-    let nextPermissions =
-      parsedPermissions === undefined ? [...defaults] : parsedPermissions;
-
-    // * Only actors with roles_assign (or owners) may customize away from defaults.
-    const canAssignRoles =
-      actor.role === APP_ROLES.INSTITUTE ||
-      resolveActorPermissions(actor).includes(
-        INSTITUTE_PERMISSIONS.ROLES_ASSIGN,
-      );
-
-    if (!canAssignRoles) {
-      nextPermissions = [...defaults];
-    }
+    const grant = await resolveGrantBundle({
+      role: nextRole,
+      permissions,
+      customRoleId,
+      actor,
+      instituteId,
+    });
+    const nextPermissions = grant.permissions;
+    const nextCustomRoleId = grant.customRoleId;
 
     const existing = await User.findOne({ mobileNumber: normalizedMobile });
     if (existing) {
@@ -478,6 +929,7 @@ class InstituteTeamService {
         normalizedEmail,
         nextExamGoals,
         nextPermissions,
+        nextCustomRoleId,
         profilePhotoPath,
         instituteId,
         owner,
@@ -503,17 +955,23 @@ class InstituteTeamService {
         instituteName: owner.instituteName || owner.fullName || '',
         instituteLogoPath: owner.instituteLogoPath || '',
         permissions: nextPermissions,
+        customRoleId: nextCustomRoleId,
         examGoals: nextExamGoals,
         profilePhotoPath: photoPath,
       });
 
-      if (nextRole === APP_ROLES.EDUCATOR) {
+      if (nextRole === APP_ROLES.EDUCATOR || nextRole === APP_ROLES.INSTITUTE_ADMIN) {
         await EducatorProfile.create({
           userId: member._id,
           type: EDUCATOR_PROFILE_TYPES.INSTITUTE,
           instituteId,
           status: EDUCATOR_PROFILE_STATUSES.INVITED,
           permissions: nextPermissions,
+          customRoleId: nextCustomRoleId,
+          staffRole:
+            nextRole === APP_ROLES.INSTITUTE_ADMIN
+              ? INSTITUTE_STAFF_ROLES.INSTITUTE_ADMIN
+              : INSTITUTE_STAFF_ROLES.EDUCATOR,
           displayName: name,
           examGoals: nextExamGoals,
           profilePhotoPath: photoPath,
@@ -536,7 +994,8 @@ class InstituteTeamService {
   }
 
   /**
-   * Hires an already-registered freelancer without creating a second User.
+   * Hires an already-registered freelancer or learner without a second User.
+   * Learners keep role `user`/`aspirant` and gain an institute membership profile.
    * @param {{
    *   existing: import('mongoose').Document,
    *   nextRole: string,
@@ -544,6 +1003,7 @@ class InstituteTeamService {
    *   normalizedEmail: string,
    *   nextExamGoals: string[],
    *   nextPermissions: string[],
+   *   nextCustomRoleId?: import('mongoose').Types.ObjectId | null,
    *   profilePhotoPath?: string,
    *   instituteId: string,
    *   owner: import('mongoose').Document,
@@ -557,42 +1017,60 @@ class InstituteTeamService {
     normalizedEmail,
     nextExamGoals,
     nextPermissions,
+    nextCustomRoleId = null,
     profilePhotoPath,
     instituteId,
     owner,
     actor,
   }) {
-    if (nextRole !== APP_ROLES.EDUCATOR) {
-      throw new AppError(
-        'This mobile number is already registered on BIGB.',
-        HTTP_STATUS.CONFLICT,
-        { code: 'MOBILE_ALREADY_REGISTERED' },
-      );
-    }
-
     const isFreelancer =
       existing.role === APP_ROLES.EDUCATOR &&
       !existing.instituteId &&
       existing.accountStatus === ACCOUNT_STATUS.ACTIVE;
 
-    if (!isFreelancer) {
+    const isLearner =
+      isLearnerRole(existing.role) &&
+      !existing.instituteId &&
+      existing.accountStatus === ACCOUNT_STATUS.ACTIVE;
+
+    if (isFreelancer) {
+      if (nextRole !== APP_ROLES.EDUCATOR) {
+        throw new AppError(
+          'This mobile number is already registered on BIGB.',
+          HTTP_STATUS.CONFLICT,
+          { code: 'MOBILE_ALREADY_REGISTERED' },
+        );
+      }
+
+      const freelancerProfile = await EducatorProfile.findOne({
+        userId: existing._id,
+        type: EDUCATOR_PROFILE_TYPES.FREELANCER,
+        status: EDUCATOR_PROFILE_STATUSES.ACTIVE,
+      });
+      if (!freelancerProfile) {
+        throw new AppError(
+          'This educator is not an approved freelancer yet.',
+          HTTP_STATUS.BAD_REQUEST,
+          { code: 'NOT_APPROVED_FREELANCER' },
+        );
+      }
+    } else if (isLearner) {
+      if (
+        nextRole !== APP_ROLES.EDUCATOR &&
+        nextRole !== APP_ROLES.INSTITUTE_ADMIN
+      ) {
+        throw new AppError(
+          'This mobile number is already registered on BIGB.',
+          HTTP_STATUS.CONFLICT,
+          { code: 'MOBILE_ALREADY_REGISTERED' },
+        );
+      }
+      await ensurePersonalLearnerProfile(existing);
+    } else {
       throw new AppError(
         'This mobile number is already registered on BIGB.',
         HTTP_STATUS.CONFLICT,
         { code: 'MOBILE_ALREADY_REGISTERED' },
-      );
-    }
-
-    const freelancerProfile = await EducatorProfile.findOne({
-      userId: existing._id,
-      type: EDUCATOR_PROFILE_TYPES.FREELANCER,
-      status: EDUCATOR_PROFILE_STATUSES.ACTIVE,
-    });
-    if (!freelancerProfile) {
-      throw new AppError(
-        'This educator is not an approved freelancer yet.',
-        HTTP_STATUS.BAD_REQUEST,
-        { code: 'NOT_APPROVED_FREELANCER' },
       );
     }
 
@@ -600,8 +1078,8 @@ class InstituteTeamService {
     if (already) {
       throw new AppError(
         already.status === EDUCATOR_PROFILE_STATUSES.ACTIVE
-          ? 'This educator already collaborates with your institute.'
-          : 'An invite or collaboration already exists for this educator.',
+          ? 'This person already collaborates with your institute.'
+          : 'An invite or collaboration already exists for this person.',
         HTTP_STATUS.CONFLICT,
         { code: 'COLLAB_EXISTS' },
       );
@@ -610,8 +1088,24 @@ class InstituteTeamService {
     const photoPath =
       String(profilePhotoPath || '').trim() ||
       existing.profilePhotoPath ||
-      freelancerProfile.profilePhotoPath ||
       '';
+
+    let resolvedExamGoals = [...nextExamGoals];
+    if (nextRole === APP_ROLES.EDUCATOR && resolvedExamGoals.length === 0) {
+      if (existing.examGoal) {
+        resolvedExamGoals = [String(existing.examGoal)];
+      } else if (Array.isArray(existing.examGoals) && existing.examGoals.length) {
+        resolvedExamGoals = [...existing.examGoals];
+      }
+    }
+
+    if (nextRole === APP_ROLES.EDUCATOR && resolvedExamGoals.length === 0) {
+      throw new AppError(
+        'Select at least one exam this educator prepares students for.',
+        HTTP_STATUS.BAD_REQUEST,
+        { code: 'EXAM_GOALS_REQUIRED' },
+      );
+    }
 
     const profile = await EducatorProfile.create({
       userId: existing._id,
@@ -619,13 +1113,13 @@ class InstituteTeamService {
       instituteId,
       status: EDUCATOR_PROFILE_STATUSES.INVITED,
       permissions: nextPermissions,
-      displayName: name || existing.fullName || freelancerProfile.displayName,
-      examGoals:
-        nextExamGoals.length > 0
-          ? nextExamGoals
-          : Array.isArray(existing.examGoals)
-            ? [...existing.examGoals]
-            : [],
+      customRoleId: nextCustomRoleId || null,
+      staffRole:
+        nextRole === APP_ROLES.INSTITUTE_ADMIN
+          ? INSTITUTE_STAFF_ROLES.INSTITUTE_ADMIN
+          : INSTITUTE_STAFF_ROLES.EDUCATOR,
+      displayName: name || existing.fullName || '',
+      examGoals: resolvedExamGoals,
       profilePhotoPath: photoPath,
       invitedByUserId: actor._id,
       joinSource: 'institute_hire',
@@ -646,7 +1140,7 @@ class InstituteTeamService {
       instituteName: owner.instituteName || owner.fullName || 'Institute',
     });
 
-    return toProfileTeamMember(profile, existing, owner);
+    return toProfileTeamMemberResolved(profile, existing, owner);
   }
 
   /**
@@ -709,7 +1203,7 @@ class InstituteTeamService {
       instituteName: owner?.instituteName || owner?.fullName || 'Institute',
     });
 
-    return toProfileTeamMember(profile, memberUser, owner);
+    return toProfileTeamMemberResolved(profile, memberUser, owner);
   }
 
   /**
@@ -782,7 +1276,7 @@ class InstituteTeamService {
   }
 
   /**
-   * Search approved freelancer educators to hire by name (or mobile).
+   * Search hireable people: approved freelancer educators + active learners.
    * @param {{ actor: import('mongoose').Document, q?: string }} input
    */
   async searchFreelancers({ actor, q }) {
@@ -797,7 +1291,7 @@ class InstituteTeamService {
       );
     if (!canAdd) {
       throw new AppError(
-        'You do not have permission to hire educators.',
+        'You do not have permission to hire team members.',
         HTTP_STATUS.FORBIDDEN,
         { code: 'INSTITUTE_FORBIDDEN' },
       );
@@ -806,7 +1300,7 @@ class InstituteTeamService {
     const query = String(q || '').trim();
     /** @type {Record<string, unknown>} */
     const userFilter = {
-      role: APP_ROLES.EDUCATOR,
+      role: { $in: [APP_ROLES.EDUCATOR, APP_ROLES.USER, APP_ROLES.ASPIRANT] },
       accountStatus: ACCOUNT_STATUS.ACTIVE,
       instituteId: null,
     };
@@ -827,7 +1321,7 @@ class InstituteTeamService {
 
     const candidates = await User.find(userFilter)
       .select(
-        'fullName email mobileNumber examGoals profilePhotoPath verificationLevel',
+        'fullName email mobileNumber role examGoal examGoals profilePhotoPath verificationLevel',
       )
       .sort({ fullName: 1 })
       .limit(40);
@@ -843,7 +1337,7 @@ class InstituteTeamService {
       status: EDUCATOR_PROFILE_STATUSES.ACTIVE,
     }).select('userId');
 
-    const approvedIds = new Set(
+    const approvedEducatorIds = new Set(
       freelancerProfiles.map((row) => String(row.userId)),
     );
 
@@ -860,15 +1354,25 @@ class InstituteTeamService {
     );
 
     return candidates
-      .filter((row) => approvedIds.has(String(row._id)))
+      .filter((row) => {
+        if (isLearnerRole(row.role)) {
+          return true;
+        }
+        return approvedEducatorIds.has(String(row._id));
+      })
       .map((row) => {
         const id = String(row._id);
+        const examGoals = Array.isArray(row.examGoals) ? [...row.examGoals] : [];
+        if (row.examGoal && !examGoals.includes(row.examGoal)) {
+          examGoals.unshift(row.examGoal);
+        }
         return {
           id,
           fullName: row.fullName || '',
           email: row.email || '',
           mobileNumber: row.mobileNumber || '',
-          examGoals: Array.isArray(row.examGoals) ? row.examGoals : [],
+          role: isLearnerRole(row.role) ? APP_ROLES.USER : APP_ROLES.EDUCATOR,
+          examGoals,
           profilePhotoPath: row.profilePhotoPath || undefined,
           verificationLevel: row.verificationLevel || 0,
           collabStatus: collabStatus.get(id) || null,
@@ -889,6 +1393,7 @@ class InstituteTeamService {
     actor,
     freelancerUserId,
     permissions,
+    customRoleId,
     examGoals,
   }) {
     const instituteId = resolveActorInstituteId(actor);
@@ -923,36 +1428,33 @@ class InstituteTeamService {
 
     const existing = await User.findById(freelancerUserId);
     if (!existing) {
-      throw new AppError('Educator not found.', HTTP_STATUS.NOT_FOUND, {
+      throw new AppError('User not found.', HTTP_STATUS.NOT_FOUND, {
         code: 'USER_NOT_FOUND',
       });
     }
 
-    const defaults = ROLE_DEFAULT_PERMISSIONS[APP_ROLES.EDUCATOR] || [];
-    const parsedPermissions = parsePermissionsField(permissions);
-    let nextPermissions =
-      parsedPermissions === undefined ? [...defaults] : parsedPermissions;
-
-    const canAssignRoles =
-      actor.role === APP_ROLES.INSTITUTE ||
-      resolveActorPermissions(actor).includes(
-        INSTITUTE_PERMISSIONS.ROLES_ASSIGN,
-      );
-    if (!canAssignRoles) {
-      nextPermissions = [...defaults];
-    }
+    const grant = await resolveGrantBundle({
+      role: APP_ROLES.EDUCATOR,
+      permissions,
+      customRoleId,
+      actor,
+      instituteId,
+    });
 
     const nextExamGoals = sanitizeExamGoals(
       examGoals !== undefined ? examGoals : existing.examGoals,
     );
-    const resolvedExamGoals =
+    let resolvedExamGoals =
       nextExamGoals.length > 0
         ? nextExamGoals
         : Array.isArray(existing.examGoals)
           ? [...existing.examGoals]
           : [];
+    if (resolvedExamGoals.length === 0 && existing.examGoal) {
+      resolvedExamGoals = [String(existing.examGoal)];
+    }
 
-    if (resolvedExamGoals.length === 0) {
+    if (resolvedExamGoals.length === 0 && !isLearnerRole(existing.role)) {
       throw new AppError(
         'This educator has no exam goals on file. Ask them to update their profile, or hire via full invite form.',
         HTTP_STATUS.BAD_REQUEST,
@@ -963,10 +1465,11 @@ class InstituteTeamService {
     return this.#inviteExistingFreelancer({
       existing,
       nextRole: APP_ROLES.EDUCATOR,
-      name: existing.fullName || 'Educator',
+      name: existing.fullName || 'Member',
       normalizedEmail: existing.email,
       nextExamGoals: resolvedExamGoals,
-      nextPermissions,
+      nextPermissions: grant.permissions,
+      nextCustomRoleId: grant.customRoleId,
       profilePhotoPath: existing.profilePhotoPath || '',
       instituteId,
       owner,
@@ -989,6 +1492,7 @@ class InstituteTeamService {
     memberId,
     fullName,
     permissions,
+    customRoleId,
     examGoals,
     profilePhotoPath,
     accountStatus,
@@ -996,12 +1500,25 @@ class InstituteTeamService {
   }) {
     const instituteId = resolveActorInstituteId(actor);
 
-    if (actor.role === APP_ROLES.EDUCATOR) {
-      throw new AppError(
-        'Educators cannot update institute team members.',
-        HTTP_STATUS.FORBIDDEN,
-        { code: 'INSTITUTE_FORBIDDEN' },
-      );
+    // * Profile-backed hire rows use EducatorProfile id; legacy rows use User id.
+    const profileMember = await EducatorProfile.findOne({
+      _id: memberId,
+      type: EDUCATOR_PROFILE_TYPES.INSTITUTE,
+      instituteId,
+      status: { $in: [...OPEN_COLLAB_STATUSES] },
+    });
+
+    if (profileMember) {
+      return this.#updateProfileMember({
+        profile: profileMember,
+        instituteId,
+        fullName,
+        permissions,
+        customRoleId,
+        examGoals,
+        profilePhotoPath,
+        actor,
+      });
     }
 
     const member = await User.findById(memberId);
@@ -1041,10 +1558,31 @@ class InstituteTeamService {
       member.fullName = name;
     }
 
-    if (permissions !== undefined) {
+    if (permissions !== undefined || customRoleId !== undefined) {
       assertActorHasPermission(actor, INSTITUTE_PERMISSIONS.ROLES_ASSIGN);
-      const parsed = parsePermissionsField(permissions);
-      member.permissions = parsed || [];
+      const grant = await resolveGrantBundle({
+        role: member.role,
+        permissions:
+          permissions !== undefined ? permissions : member.permissions,
+        customRoleId:
+          customRoleId !== undefined
+            ? customRoleId || null
+            : member.customRoleId
+              ? String(member.customRoleId)
+              : undefined,
+        actor,
+        instituteId,
+      });
+      // * Empty string clears the custom template while keeping permissions.
+      if (customRoleId === '' || customRoleId === null) {
+        member.customRoleId = null;
+        if (permissions !== undefined) {
+          member.permissions = parsePermissionsField(permissions) || [];
+        }
+      } else {
+        member.permissions = grant.permissions;
+        member.customRoleId = grant.customRoleId;
+      }
     }
 
     if (examGoals !== undefined) {
@@ -1122,7 +1660,131 @@ class InstituteTeamService {
     }
 
     await member.save();
+
+    // * Keep mirrored institute educator profile grants in sync.
+    if (member.role === APP_ROLES.EDUCATOR) {
+      await EducatorProfile.updateOne(
+        {
+          userId: member._id,
+          type: EDUCATOR_PROFILE_TYPES.INSTITUTE,
+          instituteId,
+          status: { $in: [...OPEN_COLLAB_STATUSES] },
+        },
+        {
+          $set: {
+            permissions: member.permissions,
+            customRoleId: member.customRoleId,
+            ...(examGoals !== undefined ? { examGoals: member.examGoals } : {}),
+            ...(fullName !== undefined ? { displayName: member.fullName } : {}),
+            ...(profilePhotoPath !== undefined
+              ? { profilePhotoPath: member.profilePhotoPath }
+              : {}),
+          },
+        },
+      );
+    }
+
     return toTeamMember(member);
+  }
+
+  /**
+   * Updates permissions / details on a profile-backed team row.
+   * @param {{
+   *   profile: import('mongoose').Document,
+   *   instituteId: string,
+   *   fullName?: string,
+   *   permissions?: unknown,
+   *   customRoleId?: string | null,
+   *   examGoals?: unknown,
+   *   profilePhotoPath?: string,
+   *   actor: import('mongoose').Document,
+   * }} input
+   */
+  async #updateProfileMember({
+    profile,
+    instituteId,
+    fullName,
+    permissions,
+    customRoleId,
+    examGoals,
+    profilePhotoPath,
+    actor,
+  }) {
+    const memberUser = await User.findById(profile.userId);
+    if (!memberUser) {
+      throw new AppError('Team member not found.', HTTP_STATUS.NOT_FOUND, {
+        code: 'TEAM_MEMBER_NOT_FOUND',
+      });
+    }
+
+    if (String(memberUser._id) === String(actor._id)) {
+      throw new AppError(
+        'You cannot edit your own team account here.',
+        HTTP_STATUS.BAD_REQUEST,
+        { code: 'CANNOT_EDIT_SELF' },
+      );
+    }
+
+    if (fullName !== undefined) {
+      assertActorHasPermission(actor, INSTITUTE_PERMISSIONS.TEAM_MANAGE);
+      const name = String(fullName || '').trim();
+      if (!name || name.length < 2) {
+        throw new AppError('Enter a full name.', HTTP_STATUS.BAD_REQUEST, {
+          code: 'INVALID_NAME',
+        });
+      }
+      profile.displayName = name;
+    }
+
+    if (permissions !== undefined || customRoleId !== undefined) {
+      assertActorHasPermission(actor, INSTITUTE_PERMISSIONS.ROLES_ASSIGN);
+      if (customRoleId === '' || customRoleId === null) {
+        profile.customRoleId = null;
+        if (permissions !== undefined) {
+          profile.permissions = parsePermissionsField(permissions) || [];
+        }
+      } else {
+        const grant = await resolveGrantBundle({
+          role: APP_ROLES.EDUCATOR,
+          permissions:
+            permissions !== undefined ? permissions : profile.permissions,
+          customRoleId:
+            customRoleId !== undefined
+              ? customRoleId
+              : profile.customRoleId
+                ? String(profile.customRoleId)
+                : undefined,
+          actor,
+          instituteId,
+        });
+        profile.permissions = grant.permissions;
+        profile.customRoleId = grant.customRoleId;
+      }
+    }
+
+    if (examGoals !== undefined) {
+      assertActorHasPermission(actor, INSTITUTE_PERMISSIONS.TEAM_MANAGE);
+      const nextExamGoals = sanitizeExamGoals(examGoals);
+      if (nextExamGoals.length === 0) {
+        throw new AppError(
+          'Select at least one exam this educator prepares students for.',
+          HTTP_STATUS.BAD_REQUEST,
+          { code: 'EXAM_GOALS_REQUIRED' },
+        );
+      }
+      profile.examGoals = nextExamGoals;
+    }
+
+    if (profilePhotoPath !== undefined) {
+      assertActorHasPermission(actor, INSTITUTE_PERMISSIONS.TEAM_MANAGE);
+      profile.profilePhotoPath = String(profilePhotoPath || '').trim();
+    }
+
+    await profile.save();
+    const owner = await User.findById(instituteId).select(
+      'instituteName fullName instituteLogoPath instituteCode',
+    );
+    return toProfileTeamMemberResolved(profile, memberUser, owner);
   }
 
   /**
@@ -1132,14 +1794,6 @@ class InstituteTeamService {
    */
   async removeMember({ memberId, actor }) {
     const instituteId = resolveActorInstituteId(actor);
-
-    if (actor.role === APP_ROLES.EDUCATOR) {
-      throw new AppError(
-        'Educators cannot remove institute team members.',
-        HTTP_STATUS.FORBIDDEN,
-        { code: 'INSTITUTE_FORBIDDEN' },
-      );
-    }
 
     const member = await User.findById(memberId);
     if (
@@ -1220,7 +1874,7 @@ class InstituteTeamService {
         code: 'USER_NOT_FOUND',
       });
     }
-    return toProfileTeamMember(profile, memberUser, owner);
+    return toProfileTeamMemberResolved(profile, memberUser, owner);
   }
 
   /**
@@ -1244,7 +1898,7 @@ class InstituteTeamService {
         code: 'USER_NOT_FOUND',
       });
     }
-    return toProfileTeamMember(profile, memberUser, owner);
+    return toProfileTeamMemberResolved(profile, memberUser, owner);
   }
 
   /**
@@ -1268,7 +1922,7 @@ class InstituteTeamService {
         code: 'USER_NOT_FOUND',
       });
     }
-    return toProfileTeamMember(profile, memberUser, owner);
+    return toProfileTeamMemberResolved(profile, memberUser, owner);
   }
 
   /**
@@ -1292,10 +1946,11 @@ class InstituteTeamService {
         code: 'USER_NOT_FOUND',
       });
     }
-    return toProfileTeamMember(profile, memberUser, owner);
+    return toProfileTeamMemberResolved(profile, memberUser, owner);
   }
 }
 
 module.exports = {
   instituteTeamService: new InstituteTeamService(),
+  hydrateInstituteActorContext,
 };

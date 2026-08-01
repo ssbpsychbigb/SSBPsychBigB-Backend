@@ -175,6 +175,7 @@ function toPublicUser(userDoc) {
       ? String(json.invitedByUserId)
       : undefined,
     permissions: json.permissions || [],
+    customRoleId: json.customRoleId ? String(json.customRoleId) : undefined,
     instituteCode: json.instituteCode || undefined,
     activeProfileId: json.activeProfileId
       ? String(json.activeProfileId)
@@ -246,7 +247,7 @@ class AuthService {
 
     if (!role) {
       throw new AppError(
-        'Invalid join type. Use aspirant, institute, defence_officer, or educator.',
+        'Invalid join type. Use user, institute, defence_officer, or educator.',
         HTTP_STATUS.BAD_REQUEST,
         { code: 'INVALID_JOIN_TYPE' },
       );
@@ -312,7 +313,7 @@ class AuthService {
       permissions: [],
     };
 
-    if (role === APP_ROLES.ASPIRANT) {
+    if (role === APP_ROLES.USER || role === APP_ROLES.ASPIRANT) {
       const fullName = String(body.fullName || '').trim();
       const examGoal = String(body.examGoal || '').trim();
 
@@ -330,6 +331,8 @@ class AuthService {
 
       profile.fullName = fullName;
       profile.examGoal = examGoal;
+      // * Persist canonical learner role for new registers.
+      profile.role = APP_ROLES.USER;
     }
 
     if (role === APP_ROLES.INSTITUTE) {
