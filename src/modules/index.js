@@ -20,6 +20,8 @@ const { adminApprovalsRouter } = require('./admin-approvals/admin-approvals.rout
 const { adminUsersRouter } = require('./admin-users/admin-users.routes');
 const { adminStaffRouter } = require('./admin-staff/admin-staff.routes');
 const { instituteTeamRouter } = require('./institute-team/institute-team.routes');
+const { feedRouter } = require('./feed/feed.routes');
+const { adminFeedRouter } = require('./admin-feed/admin-feed.routes');
 
 module.exports = {
   healthRouter,
@@ -29,4 +31,6 @@ module.exports = {
   adminUsersRouter,
   adminStaffRouter,
   instituteTeamRouter,
+  feedRouter,
+  adminFeedRouter,
 };

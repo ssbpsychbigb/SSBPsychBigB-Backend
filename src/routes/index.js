@@ -9,6 +9,8 @@ const {
   adminUsersRouter,
   adminStaffRouter,
   instituteTeamRouter,
+  feedRouter,
+  adminFeedRouter,
 } = require('../modules');
 
 /**
@@ -24,9 +26,13 @@ apiRouter.use('/admin/auth', adminAuthRouter);
 apiRouter.use('/admin/approvals', adminApprovalsRouter);
 apiRouter.use('/admin/users', adminUsersRouter);
 apiRouter.use('/admin/staff', adminStaffRouter);
+apiRouter.use('/admin/feed', adminFeedRouter);
 
 // * Institute panel APIs — JWT must carry portal: "app"
 apiRouter.use('/institute/team', instituteTeamRouter);
+
+// * Social Feed — Module 4 (routes: /feed/*, /posts/*)
+apiRouter.use(feedRouter);
 
 // ! Dev-only: email test + template preview routes
 if (process.env.NODE_ENV !== 'production') {
