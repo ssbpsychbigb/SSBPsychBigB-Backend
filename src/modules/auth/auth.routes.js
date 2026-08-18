@@ -8,17 +8,31 @@ const { requireAppAuth } = require('../../common/middleware/requireAppAuth');
 /**
  * App-portal auth routes.
  *
- * POST /auth/register                — create user (multipart) → OTP
- * POST /auth/otp/send                — login OTP or register resend
- * POST /auth/otp/verify              — verify mobile → JWT + user
- * GET  /auth/me                      — current user (Bearer)
- * POST /auth/application/resubmit    — fix rejected application fields
+ * POST /auth/register                      — create user (multipart) → OTP
+ * POST /auth/otp/send                      — login OTP or register resend
+ * POST /auth/otp/verify                    — verify mobile → JWT + user
+ * POST /auth/email/send-verification       — email verify OTP + link (Bearer)
+ * POST /auth/email/verify-otp              — confirm email OTP (Bearer)
+ * POST /auth/email/verify-token            — confirm email magic link (public)
+ * GET  /auth/me                            — current user (Bearer)
+ * POST /auth/application/resubmit          — fix rejected application fields
  */
 const authRouter = Router();
 
 authRouter.post('/register', registerUpload, authController.register);
 authRouter.post('/otp/send', authController.sendOtp);
 authRouter.post('/otp/verify', authController.verifyOtp);
+authRouter.post(
+  '/email/send-verification',
+  requireAppAuth,
+  authController.sendEmailVerification,
+);
+authRouter.post(
+  '/email/verify-otp',
+  requireAppAuth,
+  authController.verifyEmailOtp,
+);
+authRouter.post('/email/verify-token', authController.verifyEmailToken);
 authRouter.get('/me', requireAppAuth, authController.me);
 authRouter.post(
   '/application/resubmit',

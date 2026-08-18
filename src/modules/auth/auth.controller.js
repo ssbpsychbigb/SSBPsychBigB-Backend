@@ -4,6 +4,7 @@ const { asyncHandler } = require('../../common/middleware/asyncHandler');
 const { ApiResponse } = require('../../common/utils/ApiResponse');
 const { HTTP_STATUS } = require('../../common/constants/httpStatus');
 const { authService, toPublicUser } = require('./auth.service');
+const { emailVerificationService } = require('./email-verification.service');
 const { User } = require('./user.model');
 const {
   educatorCollabService,
@@ -62,6 +63,56 @@ class AuthController {
     return ApiResponse.success(res, {
       statusCode: HTTP_STATUS.OK,
       message: 'Verified successfully',
+      data,
+    });
+  });
+
+  /**
+   * POST /auth/email/send-verification
+   */
+  sendEmailVerification = asyncHandler(async (req, res) => {
+    const data = await emailVerificationService.sendVerification(req.auth.sub);
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: data.alreadyVerified
+        ? 'Email already verified'
+        : data.emailSent
+          ? 'Verification email sent'
+          : 'Verification code generated',
+      data,
+    });
+  });
+
+  /**
+   * POST /auth/email/verify-otp
+   */
+  verifyEmailOtp = asyncHandler(async (req, res) => {
+    const data = await emailVerificationService.verifyOtp({
+      userId: req.auth.sub,
+      otp: req.body.otp,
+    });
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: data.alreadyVerified
+        ? 'Email already verified'
+        : 'Email verified successfully',
+      data,
+    });
+  });
+
+  /**
+   * POST /auth/email/verify-token
+   */
+  verifyEmailToken = asyncHandler(async (req, res) => {
+    const data = await emailVerificationService.verifyToken(req.body.token);
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: data.alreadyVerified
+        ? 'Email already verified'
+        : 'Email verified successfully',
       data,
     });
   });
