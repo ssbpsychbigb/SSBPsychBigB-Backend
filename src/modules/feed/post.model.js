@@ -147,6 +147,12 @@ const postSchema = new mongoose.Schema(
       default: null,
       index: true,
     },
+    /** Community announcement posts (Module 5). */
+    isAnnouncement: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
     stats: { type: statsSchema, default: () => ({}) },
     trendingScore: { type: Number, default: 0, index: true },
     pinnedAt: { type: Date, default: null },

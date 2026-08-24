@@ -47,6 +47,7 @@ const limitEngage = createRateLimiter({
 
 feedRouter.get('/feed/meta', feedController.meta);
 feedRouter.get('/feed/latest', optionalAppAuth, feedController.latest);
+feedRouter.get('/feed/reels', optionalAppAuth, feedController.reels);
 feedRouter.get('/feed/following', ...requireActiveAppUser, feedController.following);
 feedRouter.get('/feed/trending', optionalAppAuth, feedController.trending);
 feedRouter.get(

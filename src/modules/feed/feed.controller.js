@@ -32,6 +32,20 @@ class FeedController {
     });
   });
 
+  reels = asyncHandler(async (req, res) => {
+    const data = await feedService.getReelsFeed({
+      viewerId: req.auth?.sub || null,
+      cursor: req.query.cursor,
+      limit: req.query.limit,
+    });
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Prep reels',
+      data,
+    });
+  });
+
   following = asyncHandler(async (req, res) => {
     const data = await feedService.getFollowingFeed({
       viewerId: String(req.appUser._id),

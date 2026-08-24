@@ -11,6 +11,10 @@ const {
   instituteTeamRouter,
   feedRouter,
   adminFeedRouter,
+  profileRouter,
+  notificationRouter,
+  chatRouter,
+  communityRouter,
 } = require('../modules');
 
 /**
@@ -30,6 +34,18 @@ apiRouter.use('/admin/feed', adminFeedRouter);
 
 // * Institute panel APIs — JWT must carry portal: "app"
 apiRouter.use('/institute/team', instituteTeamRouter);
+
+// * User Profile & Defence Identity — Module 3
+apiRouter.use('/profile', profileRouter);
+
+// * In-app notifications — Phase C (follow events)
+apiRouter.use('/notifications', notificationRouter);
+
+// * Chat / Messaging — Phase M1 REST
+apiRouter.use('/chat', chatRouter);
+
+// * Communities — Module 5 MVP
+apiRouter.use('/communities', communityRouter);
 
 // * Social Feed — Module 4 (routes: /feed/*, /posts/*)
 apiRouter.use(feedRouter);

@@ -77,6 +77,123 @@ const userSchema = new mongoose.Schema(
       type: String,
       default: '',
     },
+    /** Public handle for /u/:username (Module 3). */
+    username: {
+      type: String,
+      trim: true,
+      lowercase: true,
+      default: '',
+    },
+    bio: {
+      type: String,
+      trim: true,
+      default: '',
+      maxlength: 2000,
+    },
+    coverPhotoPath: {
+      type: String,
+      default: '',
+    },
+    city: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    education: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    languages: {
+      type: [String],
+      default: [],
+    },
+    hobbies: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    /** Defence portfolio fields (Module 3 PROF-005). */
+    preferredService: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    targetEntry: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    ssbBoard: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    preparationStage: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    attempts: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    recommendations: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    conferenceOuts: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    preferredBranch: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    medicalStatus: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    expectedJoining: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    attemptDate: {
+      type: Date,
+      default: null,
+    },
+    /** Section visibility: public | followers | only_me (Module 3 PROF-011). */
+    privacyBio: {
+      type: String,
+      enum: ['public', 'followers', 'only_me'],
+      default: 'public',
+    },
+    privacyAbout: {
+      type: String,
+      enum: ['public', 'followers', 'only_me'],
+      default: 'public',
+    },
+    privacyDefence: {
+      type: String,
+      enum: ['public', 'followers', 'only_me'],
+      default: 'public',
+    },
+    privacyJourney: {
+      type: String,
+      enum: ['public', 'followers', 'only_me'],
+      default: 'public',
+    },
+    privacyAchievements: {
+      type: String,
+      enum: ['public', 'followers', 'only_me'],
+      default: 'public',
+    },
     instituteName: {
       type: String,
       trim: true,
@@ -200,6 +317,13 @@ userSchema.index({ email: 1 });
 userSchema.index({ role: 1, accountStatus: 1 });
 userSchema.index({ isMobileVerified: 1 });
 userSchema.index({ instituteId: 1, role: 1, accountStatus: 1 });
+userSchema.index(
+  { username: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { username: { $type: 'string', $gt: '' } },
+  },
+);
 userSchema.index(
   { instituteCode: 1 },
   {

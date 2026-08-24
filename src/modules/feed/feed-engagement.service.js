@@ -21,6 +21,8 @@ const { serializePost } = require('./feed.service');
 const config = require('../../config');
 const { refreshTrendingScore } = require('./feed-score');
 const { emitFeedEvent } = require('./feed-analytics');
+const { logger } = require('../../common/utils/logger');
+const { notificationService } = require('../notifications/notification.service');
 
 /**
  * @param {object} authorDoc
@@ -32,6 +34,7 @@ function serializeAuthor(authorDoc) {
   return {
     id: String(authorDoc._id),
     fullName: authorDoc.fullName || '',
+    username: authorDoc.username || '',
     role: authorDoc.role,
     verificationLevel: authorDoc.verificationLevel ?? 0,
     profilePhotoPath:
@@ -135,6 +138,7 @@ class FeedEngagementService {
       };
     }
 
+    let created = false;
     if (existing) {
       existing.reactionType = type;
       await existing.save();
@@ -146,6 +150,7 @@ class FeedEngagementService {
           reactionType: type,
         });
         await Post.updateOne({ _id: post._id }, { $inc: { 'stats.likes': 1 } });
+        created = true;
       } catch (error) {
         if (error?.code !== 11000) {
           throw error;
@@ -162,6 +167,13 @@ class FeedEngagementService {
       postId: String(post._id),
       meta: { liked: true, reactionType: type },
     });
+
+    if (created) {
+      await notificationService.safe(() =>
+        notificationService.notifyLike({ actor: user, post }),
+      );
+    }
+
     return {
       liked: true,
       reactionType: type,
@@ -226,13 +238,14 @@ class FeedEngagementService {
 
     let depth = 0;
     let parentId = null;
+    let parent = null;
     if (parentCommentId) {
       if (!mongoose.Types.ObjectId.isValid(parentCommentId)) {
         throw new AppError('Parent comment not found', HTTP_STATUS.NOT_FOUND, {
           code: 'PARENT_NOT_FOUND',
         });
       }
-      const parent = await Comment.findOne({
+      parent = await Comment.findOne({
         _id: parentCommentId,
         postId: post._id,
         status: 'published',
@@ -272,6 +285,38 @@ class FeedEngagementService {
       meta: { hasMedia: commentMedia.length > 0, depth },
     });
 
+    await notificationService.safe(async () => {
+      await notificationService.notifyComment({
+        actor: user,
+        post,
+        comment,
+        parent,
+      });
+      const skipIds = [];
+      if (parent?.authorId) {
+        skipIds.push(parent.authorId);
+        if (String(post.authorId) !== String(parent.authorId)) {
+          await notificationService.notifyComment({
+            actor: user,
+            post,
+            comment,
+            parent: null,
+          });
+          skipIds.push(post.authorId);
+        }
+      } else {
+        skipIds.push(post.authorId);
+      }
+      const mentionIds = await notificationService.resolveMentionIds(text);
+      await notificationService.notifyMentions({
+        actor: user,
+        post,
+        mentionUserIds: mentionIds,
+        excerptText: text,
+        skipIds,
+      });
+    });
+
     return serializeComment(comment, user);
   }
 
@@ -289,7 +334,7 @@ class FeedEngagementService {
       .sort({ createdAt: 1, _id: 1 })
       .populate(
         'authorId',
-        'fullName role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
+        'fullName username role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
       )
       .lean();
 
@@ -568,7 +613,7 @@ class FeedEngagementService {
     })
       .populate(
         'authorId',
-        'fullName role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
+        'fullName username role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
       )
       .lean();
 
@@ -589,6 +634,7 @@ class FeedEngagementService {
           bookmarked: true,
           bookmarkFolder: folderMap.get(String(row.postId)) || '',
           followingAuthor: false,
+          followsYou: false,
           pollOptionId: null,
           reported: false,
         };
@@ -705,6 +751,10 @@ class FeedEngagementService {
       postId: String(post._id),
     });
 
+    await notificationService.safe(() =>
+      notificationService.notifyShare({ actor: user, post }),
+    );
+
     return {
       shares: fresh?.stats?.shares || 0,
       url,
@@ -749,17 +799,48 @@ class FeedEngagementService {
 
     if (existing) {
       await existing.deleteOne();
+      try {
+        const { FollowEvent } = require('./follow-event.model');
+        await FollowEvent.create({
+          actorId: user._id,
+          targetId: target._id,
+          kind: 'unfollow',
+        });
+      } catch (error) {
+        logger.error('Unfollow event failed', {
+          message: error?.message,
+          actorId: String(user._id),
+          targetId: String(target._id),
+        });
+      }
       return { following: false };
     }
 
+    let created = false;
     try {
       await Follow.create({
         followerId: user._id,
         followingId: target._id,
       });
+      created = true;
     } catch (error) {
       if (error?.code !== 11000) {
         throw error;
+      }
+    }
+
+    if (created) {
+      try {
+        await notificationService.notifyFollow({
+          actor: user,
+          recipientId: target._id,
+        });
+      } catch (error) {
+        logger.error('Follow notification failed', {
+          message: error?.message,
+          actorId: String(user._id),
+          recipientId: String(target._id),
+        });
       }
     }
 

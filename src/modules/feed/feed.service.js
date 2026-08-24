@@ -31,6 +31,7 @@ const { toFeedPublicPath, detectMediaType } = require('./feed.upload');
 const { computeTrendingScore } = require('./feed-score');
 const { refreshTrendingScore } = require('./feed-score');
 const { emitFeedEvent } = require('./feed-analytics');
+const { notificationService } = require('../notifications/notification.service');
 
 /**
  * @param {string} text
@@ -206,6 +207,7 @@ function serializePost(post, author = null, viewerState = null) {
     editedAt: doc.editedAt || null,
     deletedAt: doc.deletedAt || null,
     communityId: doc.communityId ? String(doc.communityId) : null,
+    isAnnouncement: Boolean(doc.isAnnouncement),
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
     /** Blur reported content for non-authors (FEED-012 Facebook-like). */
@@ -216,6 +218,7 @@ function serializePost(post, author = null, viewerState = null) {
       ? {
           id: String(authorDoc._id),
           fullName: authorDoc.fullName || '',
+          username: authorDoc.username || '',
           role: authorDoc.role,
           verificationLevel: authorDoc.verificationLevel ?? 0,
           profilePhotoPath:
@@ -231,6 +234,7 @@ function serializePost(post, author = null, viewerState = null) {
       bookmarked: false,
       bookmarkFolder: null,
       followingAuthor: false,
+      followsYou: false,
       pollOptionId: null,
       reported: false,
     },
@@ -290,6 +294,11 @@ function visibilityFilter(viewerId, followingIds = []) {
   return { $or: or };
 }
 
+/** Home / Following / Trending exclude community-scoped posts. */
+function globalFeedCommunityClause() {
+  return { $or: [{ communityId: null }, { communityId: { $exists: false } }] };
+}
+
 /**
  * @param {string | null} viewerId
  * @returns {Promise<mongoose.Types.ObjectId[]>}
@@ -340,7 +349,7 @@ async function attachViewerStates(items, viewerId) {
     return items;
   }
 
-  const [bookmarks, follows, pollVotes, myReports] = await Promise.all([
+  const [bookmarks, follows, followsMe, pollVotes, myReports] = await Promise.all([
     Bookmark.find({ userId: viewerId, postId: { $in: postIds } })
       .select('postId folderName')
       .lean(),
@@ -349,6 +358,12 @@ async function attachViewerStates(items, viewerId) {
       followingId: { $in: authorIds },
     })
       .select('followingId')
+      .lean(),
+    Follow.find({
+      followerId: { $in: authorIds },
+      followingId: viewerId,
+    })
+      .select('followerId')
       .lean(),
     PollVote.find({ userId: viewerId, postId: { $in: postIds } })
       .select('postId optionId')
@@ -369,6 +384,7 @@ async function attachViewerStates(items, viewerId) {
     bookmarks.map((row) => [String(row.postId), row.folderName || '']),
   );
   const followingSet = new Set(follows.map((row) => String(row.followingId)));
+  const followsYouSet = new Set(followsMe.map((row) => String(row.followerId)));
   const pollVoteMap = new Map(
     pollVotes.map((row) => [String(row.postId), String(row.optionId)]),
   );
@@ -384,6 +400,7 @@ async function attachViewerStates(items, viewerId) {
         ? bookmarkMap.get(item.id) || ''
         : null,
       followingAuthor: followingSet.has(item.authorId),
+      followsYou: followsYouSet.has(item.authorId),
       pollOptionId: pollVoteMap.get(item.id) || null,
       reported: reportedSet.has(item.id),
     };
@@ -410,7 +427,7 @@ async function attachCommentPreviews(items) {
     .sort({ createdAt: 1, _id: 1 })
     .populate(
       'authorId',
-      'fullName role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
+      'fullName username role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
     )
     .lean();
 
@@ -462,7 +479,7 @@ async function queryFeedPage({ filter, cursor, limit, viewerId }) {
     .limit(pageSize + 1)
     .populate(
       'authorId',
-      'fullName role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
+      'fullName username role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
     )
     .lean();
 
@@ -693,6 +710,19 @@ class FeedService {
       ? body.mentionIds.filter((id) => mongoose.Types.ObjectId.isValid(id))
       : [];
 
+    let communityId = null;
+    const isAnnouncement = Boolean(body.isAnnouncement);
+    if (body.communityId) {
+      if (!mongoose.Types.ObjectId.isValid(body.communityId)) {
+        throw new AppError('Community not found', HTTP_STATUS.NOT_FOUND, {
+          code: 'COMMUNITY_NOT_FOUND',
+        });
+      }
+      const { communityService } = require('../community/community.service');
+      await communityService.assertMember(body.communityId, author._id);
+      communityId = body.communityId;
+    }
+
     const post = await Post.create({
       authorId: author._id,
       type,
@@ -706,6 +736,8 @@ class FeedService {
       achievement,
       hashtags: extractHashtags(content),
       mentions: mentionIds,
+      communityId,
+      isAnnouncement: Boolean(communityId && isAnnouncement),
       educationalScore: 0,
       trendingScore: 0,
     });
@@ -718,6 +750,18 @@ class FeedService {
         postId: String(post._id),
         meta: { type, categories },
       });
+      await notificationService.safe(() =>
+        notificationService.notifyMentions({
+          actor: author,
+          post,
+          mentionUserIds: mentionIds,
+          excerptText: content,
+          skipIds: [author._id],
+        }),
+      );
+      await notificationService.safe(() =>
+        notificationService.notifyBroadcast({ actor: author, post }),
+      );
       const fresh = await Post.findById(post._id);
       return serializePost(fresh, author);
     }
@@ -747,6 +791,8 @@ class FeedService {
         code: 'NOT_POST_OWNER',
       });
     }
+
+    const wasPublished = post.status === POST_STATUS.PUBLISHED;
 
     if (body.content !== undefined) {
       const content = String(body.content || '').trim();
@@ -898,6 +944,20 @@ class FeedService {
         postId: String(post._id),
         meta: { type: post.type, categories: post.categories, via: 'update' },
       });
+      await notificationService.safe(() =>
+        notificationService.notifyMentions({
+          actor: author,
+          post,
+          mentionUserIds: post.mentions || [],
+          excerptText: post.content,
+          skipIds: [author._id],
+        }),
+      );
+      if (!wasPublished) {
+        await notificationService.safe(() =>
+          notificationService.notifyBroadcast({ actor: author, post }),
+        );
+      }
     }
 
     const fresh = await Post.findById(post._id);
@@ -1013,7 +1073,7 @@ class FeedService {
       .limit(pageSize + 1)
       .populate(
         'authorId',
-        'fullName role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
+        'fullName username role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
       )
       .lean();
 
@@ -1046,7 +1106,7 @@ class FeedService {
       .limit(pageSize + 1)
       .populate(
         'authorId',
-        'fullName role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
+        'fullName username role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
       )
       .lean();
 
@@ -1096,7 +1156,7 @@ class FeedService {
 
     const fresh = await Post.findById(post._id).populate(
       'authorId',
-      'fullName role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
+      'fullName username role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
     );
     return serializePost(fresh, fresh.authorId);
   }
@@ -1152,7 +1212,7 @@ class FeedService {
       .limit(pageSize + 1)
       .populate(
         'authorId',
-        'fullName role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
+        'fullName username role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
       )
       .lean();
 
@@ -1196,7 +1256,10 @@ class FeedService {
     const page = await queryFeedPage({
       filter: {
         status: POST_STATUS.PUBLISHED,
-        ...visibilityFilter(viewerId, followingIds),
+        $and: [
+          globalFeedCommunityClause(),
+          visibilityFilter(viewerId, followingIds),
+        ],
       },
       cursor,
       limit,
@@ -1208,6 +1271,58 @@ class FeedService {
       meta: { tab: 'latest', itemCount: page.items?.length || 0 },
     });
     return page;
+  }
+
+  /**
+   * Prep Reels — published posts with video media (Home strip).
+   * @param {{ viewerId?: string | null, cursor?: string, limit?: number }} input
+   */
+  async getReelsFeed({ viewerId = null, cursor, limit }) {
+    const followingIds = await loadFollowingIds(viewerId);
+    const pageSize = Math.min(
+      Math.max(Number(limit) || 24, 1),
+      FEED_LIMITS.MAX_PAGE_SIZE,
+    );
+    const videoClause = {
+      $or: [
+        { type: POST_TYPES.VIDEO },
+        { 'media.mediaType': MEDIA_TYPES.VIDEO },
+      ],
+    };
+    const visibility = visibilityFilter(viewerId, followingIds);
+    const page = await queryFeedPage({
+      filter: {
+        status: POST_STATUS.PUBLISHED,
+        $and: [globalFeedCommunityClause(), videoClause, visibility],
+      },
+      cursor,
+      limit: pageSize,
+      viewerId,
+    });
+    emitFeedEvent({
+      event: 'feed_viewed',
+      userId: viewerId,
+      meta: { tab: 'reels', itemCount: page.items?.length || 0 },
+    });
+    return page;
+  }
+
+  /**
+   * Community-scoped feed (Module 5).
+   * @param {{ communityId: string, viewerId?: string | null, cursor?: string, limit?: number }} input
+   */
+  async getCommunityFeed({ communityId, viewerId = null, cursor, limit }) {
+    const followingIds = await loadFollowingIds(viewerId);
+    return queryFeedPage({
+      filter: {
+        status: POST_STATUS.PUBLISHED,
+        communityId: new mongoose.Types.ObjectId(communityId),
+        ...visibilityFilter(viewerId, followingIds),
+      },
+      cursor,
+      limit,
+      viewerId,
+    });
   }
 
   /**
@@ -1229,7 +1344,10 @@ class FeedService {
       filter: {
         status: POST_STATUS.PUBLISHED,
         authorId: { $in: followingIds },
-        ...visibilityFilter(viewerId, followingIds),
+        $and: [
+          globalFeedCommunityClause(),
+          visibilityFilter(viewerId, followingIds),
+        ],
       },
       cursor,
       limit,
@@ -1240,6 +1358,36 @@ class FeedService {
       event: cursor ? 'feed_refresh' : 'feed_viewed',
       userId: viewerId,
       meta: { tab: 'following', itemCount: page.items?.length || 0 },
+    });
+
+    return page;
+  }
+
+  /**
+   * Author activity — published posts by one user (Module 3 profile Activity).
+   * @param {{ authorId: string, viewerId?: string | null, cursor?: string, limit?: number }} input
+   */
+  async getAuthorFeed({ authorId, viewerId = null, cursor, limit }) {
+    if (!authorId || !mongoose.Types.ObjectId.isValid(authorId)) {
+      throw new AppError('Invalid author', HTTP_STATUS.BAD_REQUEST, {
+        code: 'INVALID_AUTHOR',
+      });
+    }
+
+    const followingIds = await loadFollowingIds(viewerId);
+    const isOwner = Boolean(viewerId && String(viewerId) === String(authorId));
+
+    const page = await queryFeedPage({
+      filter: {
+        status: POST_STATUS.PUBLISHED,
+        authorId: new mongoose.Types.ObjectId(authorId),
+        ...(isOwner
+          ? {}
+          : visibilityFilter(viewerId, followingIds)),
+      },
+      cursor,
+      limit,
+      viewerId,
     });
 
     return page;
@@ -1257,7 +1405,10 @@ class FeedService {
 
     const filter = {
       status: POST_STATUS.PUBLISHED,
-      ...visibilityFilter(viewerId, followingIds),
+      $and: [
+        globalFeedCommunityClause(),
+        visibilityFilter(viewerId, followingIds),
+      ],
     };
 
     // * Optional score cursor: score__createdAt__id
@@ -1298,7 +1449,7 @@ class FeedService {
       .limit(pageSize + 1)
       .populate(
         'authorId',
-        'fullName role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
+        'fullName username role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
       )
       .lean();
 
@@ -1335,7 +1486,7 @@ class FeedService {
     const post = await Post.findById(postId)
       .populate(
         'authorId',
-        'fullName role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
+        'fullName username role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
       )
       .lean();
 
@@ -1453,7 +1604,7 @@ class FeedService {
       fullName: { $regex: escaped, $options: 'i' },
     })
       .select(
-        'fullName role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
+        'fullName username role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
       )
       .sort({ fullName: 1 })
       .limit(pageSize)
@@ -1499,7 +1650,7 @@ class FeedService {
       .limit(pageSize + 1)
       .populate(
         'authorId',
-        'fullName role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
+        'fullName username role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
       )
       .lean();
 
@@ -1547,7 +1698,7 @@ class FeedService {
 
     const fresh = await Post.findById(post._id).populate(
       'authorId',
-      'fullName role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
+      'fullName username role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
     );
     return serializePost(fresh, fresh.authorId);
   }

@@ -22,6 +22,10 @@ const { adminStaffRouter } = require('./admin-staff/admin-staff.routes');
 const { instituteTeamRouter } = require('./institute-team/institute-team.routes');
 const { feedRouter } = require('./feed/feed.routes');
 const { adminFeedRouter } = require('./admin-feed/admin-feed.routes');
+const { profileRouter } = require('./profile/profile.routes');
+const { notificationRouter } = require('./notifications/notification.routes');
+const { chatRouter } = require('./chat/chat.routes');
+const { communityRouter } = require('./community/community.routes');
 
 module.exports = {
   healthRouter,
@@ -33,4 +37,8 @@ module.exports = {
   instituteTeamRouter,
   feedRouter,
   adminFeedRouter,
+  profileRouter,
+  notificationRouter,
+  chatRouter,
+  communityRouter,
 };
