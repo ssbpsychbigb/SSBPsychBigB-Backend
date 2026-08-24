@@ -948,6 +948,8 @@ class InstituteTeamService {
         accountStatus: ACCOUNT_STATUS.INVITED,
         isMobileVerified: false,
         mobileVerifiedAt: null,
+        isEmailVerified: false,
+        emailVerifiedAt: null,
         portal: PORTAL.APP,
         verificationLevel: 0,
         instituteId,

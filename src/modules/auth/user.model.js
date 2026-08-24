@@ -52,6 +52,15 @@ const userSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    /** False until the inbox is confirmed via email OTP or verify link. */
+    isEmailVerified: {
+      type: Boolean,
+      default: false,
+    },
+    emailVerifiedAt: {
+      type: Date,
+      default: null,
+    },
     portal: {
       type: String,
       enum: [PORTAL.APP],
@@ -316,6 +325,7 @@ const userSchema = new mongoose.Schema(
 userSchema.index({ email: 1 });
 userSchema.index({ role: 1, accountStatus: 1 });
 userSchema.index({ isMobileVerified: 1 });
+userSchema.index({ isEmailVerified: 1 });
 userSchema.index({ instituteId: 1, role: 1, accountStatus: 1 });
 userSchema.index(
   { username: 1 },

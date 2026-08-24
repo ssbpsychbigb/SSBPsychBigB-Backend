@@ -67,6 +67,15 @@ const config = Object.freeze({
       String(process.env.OTP_EXPOSE_IN_RESPONSE ?? 'true').toLowerCase() !==
       'false',
   }),
+  emailVerify: Object.freeze({
+    otpTtlSeconds: Number(process.env.EMAIL_VERIFY_OTP_TTL_SECONDS ?? '600'),
+    tokenTtlSeconds: Number(process.env.EMAIL_VERIFY_TOKEN_TTL_SECONDS ?? '86400'),
+    resendCooldownSeconds: Number(
+      process.env.EMAIL_VERIFY_RESEND_COOLDOWN ?? '60',
+    ),
+    maxSendsPerHour: Number(process.env.EMAIL_VERIFY_MAX_SENDS_PER_HOUR ?? '5'),
+    maxOtpAttempts: Number(process.env.EMAIL_VERIFY_MAX_ATTEMPTS ?? '5'),
+  }),
   upload: Object.freeze({
     dir: required('UPLOAD_DIR', 'uploads'),
     maxFileBytes: Number(required('UPLOAD_MAX_BYTES', String(5 * 1024 * 1024))),

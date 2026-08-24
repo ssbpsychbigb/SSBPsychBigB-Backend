@@ -142,7 +142,17 @@ function loginUrl(path = '/login') {
   return `${config.email.appPublicUrl}${path}`;
 }
 
+/**
+ * Public email-verify landing (frontend posts the token — avoids email-client GET prefetch).
+ * @param {string} token
+ */
+function verifyEmailUrl(token) {
+  const encoded = encodeURIComponent(String(token || ''));
+  return `${config.email.appPublicUrl}/verify-email?token=${encoded}`;
+}
+
 module.exports = {
   buildTemplate,
   loginUrl,
+  verifyEmailUrl,
 };

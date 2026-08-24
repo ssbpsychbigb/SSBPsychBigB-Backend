@@ -150,6 +150,8 @@ function toPublicUser(userDoc) {
     role: json.role,
     accountStatus: json.accountStatus,
     isMobileVerified: Boolean(json.isMobileVerified),
+    isEmailVerified: Boolean(json.isEmailVerified),
+    emailVerifiedAt: json.emailVerifiedAt || undefined,
     portal: json.portal,
     verificationLevel: json.verificationLevel,
     examGoal: json.examGoal || undefined,
@@ -321,6 +323,8 @@ class AuthService {
         : ACCOUNT_STATUS.ACTIVE,
       isMobileVerified: false,
       mobileVerifiedAt: null,
+      isEmailVerified: false,
+      emailVerifiedAt: null,
       portal: PORTAL.APP,
       verificationLevel: 0,
       examGoal: '',
@@ -782,7 +786,13 @@ class AuthService {
           code: 'INVALID_EMAIL',
         });
       }
-      user.email = email;
+      if (email !== String(user.email || '').trim().toLowerCase()) {
+        user.email = email;
+        user.isEmailVerified = false;
+        user.emailVerifiedAt = null;
+        const { EmailVerificationChallenge } = require('./email-verification.model');
+        await EmailVerificationChallenge.deleteMany({ userId: user._id });
+      }
     }
 
     if (flaggedSet.has('mobileNumber')) {

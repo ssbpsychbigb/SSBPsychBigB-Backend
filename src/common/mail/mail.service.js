@@ -73,6 +73,25 @@ const mailService = {
     );
   },
 
+  notifyEmailVerification({ to, name, otp, verifyUrl }) {
+    return sendTemplate(
+      to,
+      'Verify your BIGB email',
+      {
+        title: 'Please verify your email',
+        intro: `Hi ${name || 'there'}, confirm this inbox so we can reach you. You can keep using BIGB in the meantime.`,
+        bullets: [
+          `Your 6-digit code is ${otp}. It expires in 10 minutes.`,
+          'Or tap the button below — the link works for 24 hours.',
+          'Do not share this code or link with anyone.',
+        ],
+        ctaLabel: 'Verify email',
+        ctaUrl: verifyUrl,
+      },
+      { event: 'email_verification' },
+    );
+  },
+
   notifyOtpCode({ to, name, otp, purpose }) {
     const purposeLabel =
       purpose === 'register' ? 'account verification' : 'sign-in';
