@@ -30,6 +30,10 @@ function getMailerTransport() {
         user: config.email.smtp.user,
         pass: config.email.smtp.pass,
       },
+      // * Render ↔ SMTP can hang for a long time without these.
+      connectionTimeout: 8_000,
+      greetingTimeout: 8_000,
+      socketTimeout: 12_000,
     });
   }
 

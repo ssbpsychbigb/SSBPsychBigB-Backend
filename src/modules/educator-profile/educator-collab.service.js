@@ -109,9 +109,7 @@ async function listProfilesForUser(userId) {
     },
   }).sort({ createdAt: 1 });
 
-  for (const profile of profiles) {
-    await syncProfileLifecycle(profile);
-  }
+  await Promise.all(profiles.map((profile) => syncProfileLifecycle(profile)));
 
   const liveProfiles = profiles.filter(
     (row) =>
