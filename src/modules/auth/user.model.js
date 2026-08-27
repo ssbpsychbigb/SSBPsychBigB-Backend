@@ -177,6 +177,27 @@ const userSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    /** Mentor office hours (CHAT-D07) — soft badge only. */
+    mentorAvailability: {
+      enabled: { type: Boolean, default: false },
+      timezone: {
+        type: String,
+        default: 'Asia/Kolkata',
+        trim: true,
+        maxlength: 64,
+      },
+      windows: {
+        type: [
+          {
+            day: { type: Number, min: 0, max: 6, required: true },
+            start: { type: String, default: '09:00', trim: true },
+            end: { type: String, default: '17:00', trim: true },
+            _id: false,
+          },
+        ],
+        default: [],
+      },
+    },
     /** Section visibility: public | followers | only_me (Module 3 PROF-011). */
     privacyBio: {
       type: String,

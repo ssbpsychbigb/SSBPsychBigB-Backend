@@ -202,6 +202,11 @@ class FeedEngagementService {
    */
   async addComment({ user, postId, content, parentCommentId = null, media = [] }) {
     const post = await requirePublishedPost(postId);
+    if (post.commentsLocked) {
+      throw new AppError('Comments are locked on this post', HTTP_STATUS.FORBIDDEN, {
+        code: 'COMMENTS_LOCKED',
+      });
+    }
     const text = String(content || '').trim();
     const mediaInput = Array.isArray(media) ? media : [];
     const commentMedia = mediaInput

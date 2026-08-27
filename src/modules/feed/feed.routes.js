@@ -50,10 +50,22 @@ feedRouter.get('/feed/latest', optionalAppAuth, feedController.latest);
 feedRouter.get('/feed/reels', optionalAppAuth, feedController.reels);
 feedRouter.get('/feed/following', ...requireActiveAppUser, feedController.following);
 feedRouter.get('/feed/trending', optionalAppAuth, feedController.trending);
+feedRouter.get('/feed/for-you', optionalAppAuth, feedController.forYou);
 feedRouter.get(
   '/feed/mentions',
   ...requireActiveAppUser,
   feedController.searchMentions,
+);
+
+feedRouter.get(
+  '/hashtags/trending',
+  optionalAppAuth,
+  feedController.trendingHashtags,
+);
+feedRouter.get(
+  '/hashtags/:tag',
+  optionalAppAuth,
+  feedController.hashtagFeed,
 );
 
 feedRouter.get('/bookmarks', ...requireActiveAppUser, feedController.listBookmarks);

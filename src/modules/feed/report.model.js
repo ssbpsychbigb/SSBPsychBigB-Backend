@@ -30,9 +30,24 @@ const reportSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ['open', 'reviewed', 'dismissed'],
+      enum: ['open', 'reviewed', 'dismissed', 'resolved', 'escalated'],
       default: 'open',
       index: true,
+    },
+    reviewedAt: {
+      type: Date,
+      default: null,
+    },
+    reviewedByAdminId: {
+      type: mongoose.Schema.Types.ObjectId,
+      default: null,
+      index: true,
+    },
+    resolutionNote: {
+      type: String,
+      default: '',
+      trim: true,
+      maxlength: 1000,
     },
   },
   { timestamps: true, collection: 'feed_reports' },

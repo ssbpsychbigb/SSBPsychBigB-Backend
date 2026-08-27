@@ -28,10 +28,20 @@ chatRouter.post(
   ...requireActiveAppUser,
   chatController.createConversation,
 );
+chatRouter.post(
+  '/conversations/group',
+  ...requireActiveAppUser,
+  chatController.createGroupConversation,
+);
 chatRouter.get(
   '/unread-count',
   ...requireActiveAppUser,
   chatController.unreadCount,
+);
+chatRouter.get(
+  '/search',
+  ...requireActiveAppUser,
+  chatController.searchMessages,
 );
 chatRouter.post(
   '/uploads',
@@ -53,6 +63,16 @@ chatRouter.post(
   '/conversations/:id/messages',
   ...requireActiveAppUser,
   chatController.sendMessage,
+);
+chatRouter.patch(
+  '/conversations/:id/messages/:messageId',
+  ...requireActiveAppUser,
+  chatController.editMessage,
+);
+chatRouter.delete(
+  '/conversations/:id/messages/:messageId',
+  ...requireActiveAppUser,
+  chatController.deleteMessage,
 );
 chatRouter.post(
   '/conversations/:id/read',

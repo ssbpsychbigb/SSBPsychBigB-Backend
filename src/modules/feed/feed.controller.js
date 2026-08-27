@@ -416,6 +416,54 @@ class FeedController {
     });
   });
 
+  forYou = asyncHandler(async (req, res) => {
+    let user = req.appUser || null;
+    if (!user && req.auth?.sub) {
+      const { User } = require('../auth/user.model');
+      user = await User.findById(req.auth.sub).lean();
+    }
+    const data = await feedService.getForYouFeed({
+      user,
+      viewerId: req.auth?.sub || null,
+      cursor: req.query.cursor,
+      limit: req.query.limit,
+    });
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'For You feed',
+      data,
+    });
+  });
+
+  hashtagFeed = asyncHandler(async (req, res) => {
+    const data = await feedService.getHashtagFeed({
+      tag: req.params.tag,
+      viewerId: req.auth?.sub || null,
+      cursor: req.query.cursor,
+      limit: req.query.limit,
+    });
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Hashtag feed',
+      data,
+    });
+  });
+
+  trendingHashtags = asyncHandler(async (req, res) => {
+    const data = await feedService.getTrendingHashtags({
+      days: req.query.days,
+      limit: req.query.limit,
+    });
+
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Trending hashtags',
+      data,
+    });
+  });
+
   votePoll = asyncHandler(async (req, res) => {
     const { feedPhaseCService } = require('./feed-phase-c.service');
     const data = await feedPhaseCService.votePoll({

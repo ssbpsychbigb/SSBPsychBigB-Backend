@@ -13,6 +13,7 @@ const NOTIFICATION_KINDS = [
   'reminder',
   'course',
   'assessment',
+  'moderation',
 ];
 
 const notificationSchema = new mongoose.Schema(

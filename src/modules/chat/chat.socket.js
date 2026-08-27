@@ -45,6 +45,22 @@ async function peerIdsForUser(userId) {
 }
 
 /**
+ * @param {string} userId
+ * @param {string} conversationId
+ * @returns {Promise<boolean>}
+ */
+async function isMember(userId, conversationId) {
+  const membership = await ChatMembership.findOne({
+    conversationId,
+    userId,
+    deletedForUserAt: null,
+  })
+    .select('_id')
+    .lean();
+  return Boolean(membership);
+}
+
+/**
  * Attach Socket.IO to the HTTP server for chat realtime.
  * @param {import('http').Server} httpServer
  * @returns {import('socket.io').Server}
@@ -115,15 +131,9 @@ function attachChatSocket(httpServer) {
     socket.on('conversation:join', (payload) => {
       const conversationId = String(payload?.conversationId || '');
       if (!mongoose.Types.ObjectId.isValid(conversationId)) return;
-      void ChatMembership.findOne({
-        conversationId,
-        userId,
-        deletedForUserAt: null,
-      })
-        .then((membership) => {
-          if (membership) {
-            socket.join(`conversation:${conversationId}`);
-          }
+      void isMember(userId, conversationId)
+        .then((ok) => {
+          if (ok) socket.join(`conversation:${conversationId}`);
         })
         .catch(() => {});
     });
@@ -133,6 +143,37 @@ function attachChatSocket(httpServer) {
       if (conversationId) {
         socket.leave(`conversation:${conversationId}`);
       }
+    });
+
+    socket.on('typing:start', (payload) => {
+      const conversationId = String(payload?.conversationId || '');
+      if (!mongoose.Types.ObjectId.isValid(conversationId)) return;
+      void isMember(userId, conversationId)
+        .then((ok) => {
+          if (!ok) return;
+          socket.join(`conversation:${conversationId}`);
+          socket.to(`conversation:${conversationId}`).emit('typing:update', {
+            conversationId,
+            userId,
+            typing: true,
+          });
+        })
+        .catch(() => {});
+    });
+
+    socket.on('typing:stop', (payload) => {
+      const conversationId = String(payload?.conversationId || '');
+      if (!mongoose.Types.ObjectId.isValid(conversationId)) return;
+      void isMember(userId, conversationId)
+        .then((ok) => {
+          if (!ok) return;
+          socket.to(`conversation:${conversationId}`).emit('typing:update', {
+            conversationId,
+            userId,
+            typing: false,
+          });
+        })
+        .catch(() => {});
     });
 
     socket.on('presence:ping', (payload) => {

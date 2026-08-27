@@ -8,7 +8,7 @@ const {
 } = require('../../common/middleware/requireAppAuth');
 
 /**
- * Notification routes — Phase C (follow events).
+ * Notification routes — inbox + prefs + web push (Wave 5).
  */
 const notificationRouter = Router();
 
@@ -22,6 +22,31 @@ notificationRouter.get(
   '/unread-count',
   ...requireActiveAppUser,
   notificationController.unreadCount,
+);
+notificationRouter.get(
+  '/preferences',
+  ...requireActiveAppUser,
+  notificationController.getPreferences,
+);
+notificationRouter.patch(
+  '/preferences',
+  ...requireActiveAppUser,
+  notificationController.updatePreferences,
+);
+notificationRouter.get(
+  '/push/vapid-public-key',
+  ...requireActiveAppUser,
+  notificationController.pushPublicKey,
+);
+notificationRouter.post(
+  '/push/subscribe',
+  ...requireActiveAppUser,
+  notificationController.pushSubscribe,
+);
+notificationRouter.delete(
+  '/push/subscribe',
+  ...requireActiveAppUser,
+  notificationController.pushUnsubscribe,
 );
 notificationRouter.post(
   '/read-all',

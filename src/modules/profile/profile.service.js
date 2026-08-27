@@ -10,13 +10,25 @@ const { HTTP_STATUS } = require('../../common/constants/httpStatus');
 const { toPublicUser } = require('../auth/auth.service');
 const { feedService } = require('../feed/feed.service');
 const { computeCompletion } = require('./profile.completion');
+const { computeOfficerReadiness } = require('./profile.readiness');
+const { buildProfileBadges } = require('./profile.badges');
 const { getNetworkInsights: computeNetworkInsights, suggestionReason } = require('./profile.network-insights');
+const {
+  evaluateAvailability,
+  normalizeAvailabilityInput,
+} = require('./mentor-availability');
 const { UserTimeline, TIMELINE_EVENT_TYPES } = require('./timeline.model');
 const { UserAchievement, ACHIEVEMENT_CATEGORIES } = require('./achievement.model');
+const { APP_ROLES } = require('../auth/auth.constants');
 
 const USERNAME_RE = /^[a-z0-9_]{3,30}$/;
 const PRIVACY_LEVELS = new Set(['public', 'followers', 'only_me']);
 const NETWORK_KINDS = new Set(['followers', 'following', 'mutual']);
+const MENTOR_PORTFOLIO_ROLES = new Set([
+  APP_ROLES.EDUCATOR,
+  APP_ROLES.DEFENCE_OFFICER,
+]);
+const ASPIRANT_ROLES = new Set([APP_ROLES.USER, APP_ROLES.ASPIRANT, 'aspirant']);
 
 const EDITABLE_STRING_FIELDS = [
   'fullName',
@@ -167,11 +179,76 @@ async function toProfileDto(user, { viewerId = null, isOwner = false } = {}) {
     journey: canViewSection(privacy.journey, { isOwner, viewerFollows }),
     achievements: canViewSection(privacy.achievements, { isOwner, viewerFollows }),
   };
-  const [journeyCount, achievementCount] = await Promise.all([
+  const [journeyCount, achievementCount, verifiedAchievementCount] = await Promise.all([
     UserTimeline.countDocuments({ userId: user._id }),
     UserAchievement.countDocuments({ userId: user._id }),
+    UserAchievement.countDocuments({
+      userId: user._id,
+      verificationStatus: 'verified',
+    }),
   ]);
   const completion = computeCompletion(user, { journeyCount, achievementCount });
+  const readiness = computeOfficerReadiness(user, {
+    completionPercent: completion.percent,
+    journeyCount,
+    achievementCount,
+  });
+  const badges = buildProfileBadges(user, {
+    achievementCount,
+    verifiedAchievementCount,
+    completionPercent: completion.percent,
+  });
+
+  let mentorPortfolio = null;
+  if (MENTOR_PORTFOLIO_ROLES.has(user.role) || user.preparationStage === 'mentor') {
+    let menteesApprox = stats.followers;
+    try {
+      const menteeAgg = await Follow.aggregate([
+        { $match: { followingId: user._id } },
+        {
+          $lookup: {
+            from: 'users',
+            localField: 'followerId',
+            foreignField: '_id',
+            as: 'follower',
+          },
+        },
+        { $unwind: '$follower' },
+        { $match: { 'follower.role': { $in: [...ASPIRANT_ROLES] } } },
+        { $count: 'n' },
+      ]);
+      menteesApprox = menteeAgg[0]?.n ?? 0;
+    } catch {
+      menteesApprox = stats.followers;
+    }
+
+    const specialties = [];
+    if (Array.isArray(user.examGoals)) {
+      user.examGoals.forEach((g) => {
+        if (g && !specialties.includes(g)) specialties.push(String(g));
+      });
+    }
+    if (user.examGoal && !specialties.includes(user.examGoal)) {
+      specialties.unshift(String(user.examGoal));
+    }
+
+    mentorPortfolio = {
+      recommendations: Number(user.recommendations) || 0,
+      menteesApprox,
+      specialties,
+      preparationStage: user.preparationStage || '',
+      preferredService: user.preferredService || '',
+      sessionsCount: 0,
+      sessionsNote: 'Live sessions will appear here when scheduling ships.',
+      availability: evaluateAvailability(user.mentorAvailability),
+    };
+  }
+
+  const showReadiness = isOwner || sectionVisible.defence;
+  const mentorAvailability =
+    MENTOR_PORTFOLIO_ROLES.has(user.role) || user.preparationStage === 'mentor'
+      ? evaluateAvailability(user.mentorAvailability)
+      : null;
 
   const dto = {
     ...publicUser,
@@ -205,6 +282,21 @@ async function toProfileDto(user, { viewerId = null, isOwner = false } = {}) {
     privacy: isOwner ? privacy : undefined,
     sectionVisible,
     completion: isOwner ? completion : { percent: completion.percent, missing: [] },
+    officerReadiness: showReadiness
+      ? {
+          score: readiness.score,
+          band: readiness.band,
+          bandLabel: readiness.bandLabel,
+          factors: isOwner ? readiness.factors : undefined,
+        }
+      : null,
+    badges,
+    mentorAvailability:
+      mentorAvailability && (isOwner || sectionVisible.defence)
+        ? mentorAvailability
+        : null,
+    mentorPortfolio:
+      mentorPortfolio && (isOwner || sectionVisible.defence) ? mentorPortfolio : null,
   };
 
   return dto;
@@ -345,6 +437,13 @@ class ProfileService {
         if (next !== undefined && PRIVACY_LEVELS.has(String(next))) {
           user[field] = String(next);
         }
+      }
+    }
+
+    if (body.mentorAvailability !== undefined) {
+      const next = normalizeAvailabilityInput(body.mentorAvailability);
+      if (next) {
+        user.mentorAvailability = next;
       }
     }
 

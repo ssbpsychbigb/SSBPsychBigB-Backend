@@ -11,10 +11,13 @@ const {
   instituteTeamRouter,
   feedRouter,
   adminFeedRouter,
+  adminChatRouter,
   profileRouter,
   notificationRouter,
   chatRouter,
   communityRouter,
+  dayBriefRouter,
+  adminNotificationsRouter,
 } = require('../modules');
 
 /**
@@ -31,6 +34,8 @@ apiRouter.use('/admin/approvals', adminApprovalsRouter);
 apiRouter.use('/admin/users', adminUsersRouter);
 apiRouter.use('/admin/staff', adminStaffRouter);
 apiRouter.use('/admin/feed', adminFeedRouter);
+apiRouter.use('/admin/chat', adminChatRouter);
+apiRouter.use('/admin/notifications', adminNotificationsRouter);
 
 // * Institute panel APIs — JWT must carry portal: "app"
 apiRouter.use('/institute/team', instituteTeamRouter);
@@ -46,6 +51,9 @@ apiRouter.use('/chat', chatRouter);
 
 // * Communities — Module 5 MVP
 apiRouter.use('/communities', communityRouter);
+
+// * Day Brief — 24h Home strip stories
+apiRouter.use('/day-briefs', dayBriefRouter);
 
 // * Social Feed — Module 4 (routes: /feed/*, /posts/*)
 apiRouter.use(feedRouter);

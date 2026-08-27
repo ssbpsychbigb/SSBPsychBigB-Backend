@@ -73,6 +73,13 @@ const communitySchema = new mongoose.Schema(
       default: 1,
       min: 0,
     },
+    /** Opaque invite token for private join links (`?invite=`). */
+    inviteToken: {
+      type: String,
+      default: '',
+      trim: true,
+      index: true,
+    },
     status: {
       type: String,
       enum: Object.values(COMMUNITY_STATUS),
@@ -108,6 +115,11 @@ const communityMembershipSchema = new mongoose.Schema(
     joinedAt: {
       type: Date,
       default: Date.now,
+    },
+    /** When set and in the future, member cannot post (owner/mod mute). */
+    mutedUntil: {
+      type: Date,
+      default: null,
     },
   },
   { timestamps: true, collection: 'community_memberships' },

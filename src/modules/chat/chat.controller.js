@@ -34,6 +34,19 @@ class ChatController {
     });
   });
 
+  createGroupConversation = asyncHandler(async (req, res) => {
+    const data = await chatService.createGroupConversation(req.appUser, {
+      title: req.body?.title,
+      memberIds: req.body?.memberIds,
+      communityId: req.body?.communityId,
+    });
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.CREATED,
+      message: 'Group conversation ready',
+      data,
+    });
+  });
+
   getConversation = asyncHandler(async (req, res) => {
     const data = await chatService.getConversation(
       req.appUser,
@@ -58,6 +71,20 @@ class ChatController {
     });
   });
 
+  searchMessages = asyncHandler(async (req, res) => {
+    const data = await chatService.searchMessages(req.appUser, {
+      q: req.query.q,
+      conversationId: req.query.conversationId || null,
+      cursor: req.query.cursor,
+      limit: req.query.limit,
+    });
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Message search',
+      data,
+    });
+  });
+
   sendMessage = asyncHandler(async (req, res) => {
     const data = await chatService.sendMessage(req.appUser, req.params.id, {
       body: req.body?.body,
@@ -67,6 +94,33 @@ class ChatController {
     return ApiResponse.success(res, {
       statusCode: HTTP_STATUS.CREATED,
       message: 'Message sent',
+      data,
+    });
+  });
+
+  editMessage = asyncHandler(async (req, res) => {
+    const data = await chatService.editMessage(
+      req.appUser,
+      req.params.id,
+      req.params.messageId,
+      { body: req.body?.body },
+    );
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Message updated',
+      data,
+    });
+  });
+
+  deleteMessage = asyncHandler(async (req, res) => {
+    const data = await chatService.deleteMessage(
+      req.appUser,
+      req.params.id,
+      req.params.messageId,
+    );
+    return ApiResponse.success(res, {
+      statusCode: HTTP_STATUS.OK,
+      message: 'Message deleted',
       data,
     });
   });

@@ -144,13 +144,26 @@ const postSchema = new mongoose.Schema(
     },
     communityId: {
       type: mongoose.Schema.Types.ObjectId,
+      ref: 'Community',
       default: null,
+      index: true,
+    },
+    /** Moderator lock — blocks new comments / replies (SRS Role 7). */
+    commentsLocked: {
+      type: Boolean,
+      default: false,
       index: true,
     },
     /** Community announcement posts (Module 5). */
     isAnnouncement: {
       type: Boolean,
       default: false,
+      index: true,
+    },
+    /** Owner/mod pin inside a community feed (Module 5). */
+    communityPinnedAt: {
+      type: Date,
+      default: null,
       index: true,
     },
     stats: { type: statsSchema, default: () => ({}) },
@@ -170,6 +183,8 @@ postSchema.index({ status: 1, visibility: 1, createdAt: -1 });
 postSchema.index({ authorId: 1, createdAt: -1 });
 postSchema.index({ status: 1, trendingScore: -1, createdAt: -1 });
 postSchema.index({ authorId: 1, status: 1, pinnedAt: -1 });
+postSchema.index({ communityId: 1, status: 1, communityPinnedAt: -1, createdAt: -1 });
+postSchema.index({ status: 1, hashtags: 1, createdAt: -1 });
 
 const Post = mongoose.model('Post', postSchema);
 

@@ -2,7 +2,9 @@
 
 const mongoose = require('mongoose');
 
-const CONVERSATION_KINDS = ['person', 'mentor', 'institute'];
+const CONVERSATION_KINDS = ['person', 'mentor', 'institute', 'group'];
+const CONVERSATION_TYPES = ['dm', 'group'];
+const MEMBERSHIP_ROLES = ['owner', 'admin', 'member'];
 const FOLDERS = ['focused', 'other'];
 const ATTACHMENT_KINDS = ['image', 'file', 'gif'];
 const MESSAGE_STATUSES = ['sent', 'deleted'];
@@ -19,16 +21,37 @@ const chatConversationSchema = new mongoose.Schema(
       ],
       validate: {
         validator(value) {
-          return Array.isArray(value) && value.length === 2;
+          return Array.isArray(value) && value.length >= 2 && value.length <= 50;
         },
-        message: 'A conversation must have exactly two participants',
+        message: 'A conversation must have between 2 and 50 participants',
       },
     },
-    /** Sorted `${idA}:${idB}` for unique 1:1 lookup. */
+    /**
+     * DM: sorted `${idA}:${idB}`.
+     * Group: `group:${ObjectId}` (unique sparse for legacy + new).
+     */
     participantKey: {
       type: String,
       required: true,
       unique: true,
+      index: true,
+    },
+    type: {
+      type: String,
+      enum: CONVERSATION_TYPES,
+      default: 'dm',
+      index: true,
+    },
+    title: {
+      type: String,
+      default: '',
+      trim: true,
+      maxlength: 80,
+    },
+    sourceCommunityId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Community',
+      default: null,
       index: true,
     },
     kind: {
@@ -68,6 +91,11 @@ const chatMembershipSchema = new mongoose.Schema(
       ref: 'User',
       required: true,
       index: true,
+    },
+    role: {
+      type: String,
+      enum: MEMBERSHIP_ROLES,
+      default: 'member',
     },
     folder: {
       type: String,
@@ -191,6 +219,10 @@ const chatMessageSchema = new mongoose.Schema(
       enum: MESSAGE_STATUSES,
       default: 'sent',
     },
+    editedAt: {
+      type: Date,
+      default: null,
+    },
   },
   { timestamps: true, collection: 'chat_messages' },
 );
@@ -260,6 +292,11 @@ const chatReportSchema = new mongoose.Schema(
       ref: 'ChatConversation',
       default: null,
     },
+    messageId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'ChatMessage',
+      default: null,
+    },
     reason: {
       type: String,
       enum: CHAT_REPORT_REASONS,
@@ -274,12 +311,28 @@ const chatReportSchema = new mongoose.Schema(
       type: String,
       enum: ['open', 'reviewed', 'dismissed'],
       default: 'open',
+      index: true,
+    },
+    reviewedAt: {
+      type: Date,
+      default: null,
+    },
+    reviewedByAdminId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'AdminUser',
+      default: null,
+    },
+    resolutionNote: {
+      type: String,
+      default: '',
+      maxlength: 1000,
     },
   },
   { timestamps: true, collection: 'chat_reports' },
 );
 
 chatReportSchema.index({ reporterId: 1, reportedUserId: 1, createdAt: -1 });
+chatReportSchema.index({ status: 1, createdAt: -1 });
 
 const ChatBlock = mongoose.model('ChatBlock', chatBlockSchema);
 const ChatReport = mongoose.model('ChatReport', chatReportSchema);
@@ -291,6 +344,8 @@ module.exports = {
   ChatBlock,
   ChatReport,
   CONVERSATION_KINDS,
+  CONVERSATION_TYPES,
+  MEMBERSHIP_ROLES,
   FOLDERS,
   ATTACHMENT_KINDS,
   MESSAGE_STATUSES,

@@ -43,6 +43,39 @@ function extractHashtags(text) {
 }
 
 /**
+ * Map viewer profile → preferred post categories for For You.
+ * @param {object} user
+ * @returns {string[]}
+ */
+function preferredCategoriesForUser(user) {
+  const goal = String(user?.examGoal || '').toLowerCase();
+  const stage = String(user?.preparationStage || '').toLowerCase();
+  const set = new Set();
+
+  const byExam = {
+    nda: ['entry_guidance', 'motivation', 'current_affairs', 'fitness'],
+    cds: ['entry_guidance', 'motivation', 'current_affairs'],
+    afcat: ['entry_guidance', 'motivation', 'fitness'],
+    ssb: ['psychology', 'gto', 'interview', 'experience', 'recommendation_story'],
+    capf: ['entry_guidance', 'fitness', 'current_affairs'],
+    agniveer: ['entry_guidance', 'fitness', 'motivation'],
+    inet: ['entry_guidance', 'motivation'],
+  };
+  (byExam[goal] || ['motivation', 'entry_guidance', 'experience']).forEach((c) =>
+    set.add(c),
+  );
+
+  if (stage.includes('ssb') || stage.includes('interview')) {
+    ['psychology', 'gto', 'interview', 'experience'].forEach((c) => set.add(c));
+  }
+  if (stage.includes('written') || stage.includes('nda') || stage.includes('cds')) {
+    ['current_affairs', 'entry_guidance', 'books'].forEach((c) => set.add(c));
+  }
+
+  return [...set].filter((c) => POST_CATEGORIES.includes(c));
+}
+
+/**
  * @param {string} text
  * @returns {string[]}
  */
@@ -206,8 +239,15 @@ function serializePost(post, author = null, viewerState = null) {
     pinnedAt: doc.pinnedAt || null,
     editedAt: doc.editedAt || null,
     deletedAt: doc.deletedAt || null,
-    communityId: doc.communityId ? String(doc.communityId) : null,
+    communityId:
+      doc.communityId && typeof doc.communityId === 'object' && doc.communityId._id
+        ? String(doc.communityId._id)
+        : doc.communityId
+          ? String(doc.communityId)
+          : null,
+    commentsLocked: Boolean(doc.commentsLocked),
     isAnnouncement: Boolean(doc.isAnnouncement),
+    communityPinnedAt: doc.communityPinnedAt || null,
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
     /** Blur reported content for non-authors (FEED-012 Facebook-like). */
@@ -450,8 +490,9 @@ async function attachCommentPreviews(items) {
 
 /**
  * Shared cursor feed query.
+ * @param {{ filter: object, cursor?: string, limit?: number, viewerId?: string | null, sort?: object }} args
  */
-async function queryFeedPage({ filter, cursor, limit, viewerId }) {
+async function queryFeedPage({ filter, cursor, limit, viewerId, sort }) {
   const pageSize = Math.min(
     Math.max(Number(limit) || FEED_LIMITS.DEFAULT_PAGE_SIZE, 1),
     FEED_LIMITS.MAX_PAGE_SIZE,
@@ -475,7 +516,7 @@ async function queryFeedPage({ filter, cursor, limit, viewerId }) {
   }
 
   const rows = await Post.find(query)
-    .sort({ createdAt: -1, _id: -1 })
+    .sort(sort || { createdAt: -1, _id: -1 })
     .limit(pageSize + 1)
     .populate(
       'authorId',
@@ -1309,19 +1350,28 @@ class FeedService {
 
   /**
    * Community-scoped feed (Module 5).
-   * @param {{ communityId: string, viewerId?: string | null, cursor?: string, limit?: number }} input
+   * @param {{ communityId: string, viewerId?: string | null, cursor?: string, limit?: number, type?: string | null }} input
    */
-  async getCommunityFeed({ communityId, viewerId = null, cursor, limit }) {
+  async getCommunityFeed({ communityId, viewerId = null, cursor, limit, type = null }) {
     const followingIds = await loadFollowingIds(viewerId);
+    const filter = {
+      status: POST_STATUS.PUBLISHED,
+      communityId: new mongoose.Types.ObjectId(communityId),
+      ...visibilityFilter(viewerId, followingIds),
+    };
+    const typeKey = String(type || '').toLowerCase().trim();
+    if (typeKey === POST_TYPES.QUESTION) {
+      filter.type = POST_TYPES.QUESTION;
+      filter.isAnnouncement = { $ne: true };
+    } else if (typeKey === 'announcement') {
+      filter.isAnnouncement = true;
+    }
     return queryFeedPage({
-      filter: {
-        status: POST_STATUS.PUBLISHED,
-        communityId: new mongoose.Types.ObjectId(communityId),
-        ...visibilityFilter(viewerId, followingIds),
-      },
+      filter,
       cursor,
       limit,
       viewerId,
+      sort: { communityPinnedAt: -1, createdAt: -1, _id: -1 },
     });
   }
 
@@ -1467,6 +1517,211 @@ class FeedService {
       event: cursor ? 'feed_refresh' : 'feed_viewed',
       userId: viewerId,
       meta: { tab: 'trending', itemCount: items.length },
+    });
+
+    return { items, nextCursor, hasMore };
+  }
+
+  /**
+   * Hashtag feed — published posts tagged with `:tag` (FEED-D01).
+   */
+  async getHashtagFeed({ tag, viewerId = null, cursor, limit }) {
+    const normalized = String(tag || '')
+      .trim()
+      .replace(/^#/, '')
+      .toLowerCase()
+      .slice(0, 64);
+    if (!normalized) {
+      throw new AppError('Hashtag is required', HTTP_STATUS.BAD_REQUEST, {
+        code: 'HASHTAG_REQUIRED',
+      });
+    }
+
+    const followingIds = await loadFollowingIds(viewerId);
+    const page = await queryFeedPage({
+      filter: {
+        status: POST_STATUS.PUBLISHED,
+        hashtags: normalized,
+        $and: [
+          globalFeedCommunityClause(),
+          visibilityFilter(viewerId, followingIds),
+        ],
+      },
+      cursor,
+      limit,
+      viewerId,
+    });
+
+    emitFeedEvent({
+      event: 'feed_viewed',
+      userId: viewerId,
+      meta: { tab: 'hashtag', tag: normalized, itemCount: page.items?.length || 0 },
+    });
+
+    return { ...page, tag: normalized };
+  }
+
+  /**
+   * Trending hashtags by post volume (FEED-D02).
+   */
+  async getTrendingHashtags({ days = 7, limit = 12 } = {}) {
+    const windowDays = Math.min(Math.max(Number(days) || 7, 1), 30);
+    const pageSize = Math.min(Math.max(Number(limit) || 12, 1), 30);
+    const since = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000);
+
+    const rows = await Post.aggregate([
+      {
+        $match: {
+          status: POST_STATUS.PUBLISHED,
+          createdAt: { $gte: since },
+          hashtags: { $exists: true, $type: 'array', $ne: [] },
+          $or: [{ communityId: null }, { communityId: { $exists: false } }],
+        },
+      },
+      { $unwind: '$hashtags' },
+      {
+        $group: {
+          _id: '$hashtags',
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { count: -1, _id: 1 } },
+      { $limit: pageSize },
+    ]);
+
+    return {
+      items: rows.map((row) => ({
+        tag: row._id,
+        count: row.count,
+      })),
+      windowDays,
+    };
+  }
+
+  /**
+   * For You — rule-based personalization (FEED-D03). Guests fall back to trending.
+   */
+  async getForYouFeed({ user = null, viewerId = null, cursor, limit }) {
+    if (!user) {
+      return this.getTrendingFeed({ viewerId, cursor, limit });
+    }
+
+    const preferred = preferredCategoriesForUser(user);
+    const vid = viewerId || String(user._id);
+    const followingIds = await loadFollowingIds(vid);
+    const pageSize = Math.min(
+      Math.max(Number(limit) || FEED_LIMITS.DEFAULT_PAGE_SIZE, 1),
+      FEED_LIMITS.MAX_PAGE_SIZE,
+    );
+
+    const baseFilter = {
+      status: POST_STATUS.PUBLISHED,
+      $and: [
+        globalFeedCommunityClause(),
+        visibilityFilter(vid, followingIds),
+      ],
+    };
+
+    let scoreCursor = null;
+    if (cursor && typeof cursor === 'string' && cursor.includes('__')) {
+      const [scorePart, iso, id] = cursor.split('__');
+      if (iso && id && mongoose.Types.ObjectId.isValid(id)) {
+        scoreCursor = {
+          score: Number(scorePart),
+          createdAt: new Date(iso),
+          id: new mongoose.Types.ObjectId(id),
+        };
+      }
+    }
+
+    const followingOid = followingIds
+      .filter((id) => mongoose.Types.ObjectId.isValid(id))
+      .map((id) => new mongoose.Types.ObjectId(id));
+
+    const pipeline = [
+      { $match: baseFilter },
+      {
+        $addFields: {
+          categoryOverlap: {
+            $size: {
+              $setIntersection: [{ $ifNull: ['$categories', []] }, preferred],
+            },
+          },
+          followedBoost: {
+            $cond: [{ $in: ['$authorId', followingOid] }, 25, 0],
+          },
+        },
+      },
+      {
+        $addFields: {
+          forYouScore: {
+            $add: [
+              { $ifNull: ['$trendingScore', 0] },
+              { $multiply: ['$categoryOverlap', 40] },
+              '$followedBoost',
+              { $ifNull: ['$educationalScore', 0] },
+            ],
+          },
+        },
+      },
+    ];
+
+    if (scoreCursor && !Number.isNaN(scoreCursor.score)) {
+      pipeline.push({
+        $match: {
+          $or: [
+            { forYouScore: { $lt: scoreCursor.score } },
+            {
+              forYouScore: scoreCursor.score,
+              createdAt: { $lt: scoreCursor.createdAt },
+            },
+            {
+              forYouScore: scoreCursor.score,
+              createdAt: scoreCursor.createdAt,
+              _id: { $lt: scoreCursor.id },
+            },
+          ],
+        },
+      });
+    }
+
+    pipeline.push(
+      { $sort: { forYouScore: -1, createdAt: -1, _id: -1 } },
+      { $limit: pageSize + 1 },
+    );
+
+    const rows = await Post.aggregate(pipeline);
+    const hasMore = rows.length > pageSize;
+    const page = hasMore ? rows.slice(0, pageSize) : rows;
+
+    const authorIds = [...new Set(page.map((row) => String(row.authorId)))];
+    const authors = authorIds.length
+      ? await User.find({ _id: { $in: authorIds } }).select(
+          'fullName username role verificationLevel profilePhotoPath officerPhotoPath instituteLogoPath',
+        )
+      : [];
+    const authorMap = new Map(authors.map((a) => [String(a._id), a]));
+
+    let items = page.map((row) =>
+      serializePost(row, authorMap.get(String(row.authorId)) || null),
+    );
+    items = await attachViewerStates(items, vid);
+    items = await attachCommentPreviews(items);
+
+    const last = page[page.length - 1];
+    const nextCursor =
+      hasMore && last
+        ? `${last.forYouScore || 0}__${new Date(last.createdAt).toISOString()}__${String(last._id)}`
+        : null;
+
+    emitFeedEvent({
+      event: cursor ? 'feed_refresh' : 'feed_viewed',
+      userId: vid,
+      meta: {
+        tab: 'for_you',
+        itemCount: items.length,
+        preferredCategories: preferred,
+      },
     });
 
     return { items, nextCursor, hasMore };

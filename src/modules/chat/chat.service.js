@@ -15,6 +15,10 @@ const {
 } = require('./chat.model');
 const presence = require('./chat.presence');
 const { emitToUser } = require('./chat.realtime');
+const {
+  NotificationPrefs,
+} = require('../notifications/notification-prefs.model');
+const { CommunityMembership } = require('../community/community.model');
 
 const EXAM_LABELS = {
   nda: 'NDA',
@@ -88,6 +92,8 @@ function serializePeer(user) {
       headline: '',
       role: '',
       profilePhotoPath: null,
+      availabilityStatus: 'unset',
+      availabilityLabel: '',
     };
   }
 
@@ -96,6 +102,19 @@ function serializePeer(user) {
     user.officerPhotoPath ||
     user.instituteLogoPath ||
     '';
+
+  let availabilityStatus = 'unset';
+  let availabilityLabel = '';
+  try {
+    const {
+      evaluateAvailability,
+    } = require('../profile/mentor-availability');
+    const evaluated = evaluateAvailability(user.mentorAvailability);
+    availabilityStatus = evaluated.status;
+    availabilityLabel = evaluated.label || '';
+  } catch {
+    /* optional */
+  }
 
   return {
     id: String(user._id),
@@ -107,6 +126,8 @@ function serializePeer(user) {
     headline: peerHeadline(user),
     role: String(user.role || ''),
     profilePhotoPath: photo || null,
+    availabilityStatus,
+    availabilityLabel,
   };
 }
 
@@ -128,40 +149,47 @@ function truncatePreview(text, max = 120) {
  */
 function serializeMessage(message, viewerId) {
   const senderId = String(message.senderId);
-  const attachment = Array.isArray(message.attachments) && message.attachments[0]
-    ? {
-        kind: message.attachments[0].kind,
-        name: message.attachments[0].name,
-        sizeLabel:
-          message.attachments[0].size > 0
-            ? `${Math.max(1, Math.round(message.attachments[0].size / 1024))} KB`
-            : undefined,
-        path: message.attachments[0].path || undefined,
-        previewUrl:
-          message.attachments[0].previewUrl ||
-          (message.attachments[0].kind === 'image' &&
-          message.attachments[0].path
-            ? message.attachments[0].path
-            : undefined),
-        gifEmoji: message.attachments[0].gifEmoji || undefined,
-        gifTone: message.attachments[0].gifTone || undefined,
-        mime: message.attachments[0].mime || undefined,
-        size: message.attachments[0].size || undefined,
-      }
-    : undefined;
+  const isDeleted = message.status === 'deleted';
+  const attachment =
+    !isDeleted &&
+    Array.isArray(message.attachments) &&
+    message.attachments[0]
+      ? {
+          kind: message.attachments[0].kind,
+          name: message.attachments[0].name,
+          sizeLabel:
+            message.attachments[0].size > 0
+              ? `${Math.max(1, Math.round(message.attachments[0].size / 1024))} KB`
+              : undefined,
+          path: message.attachments[0].path || undefined,
+          previewUrl:
+            message.attachments[0].previewUrl ||
+            (message.attachments[0].kind === 'image' &&
+            message.attachments[0].path
+              ? message.attachments[0].path
+              : undefined),
+          gifEmoji: message.attachments[0].gifEmoji || undefined,
+          gifTone: message.attachments[0].gifTone || undefined,
+          mime: message.attachments[0].mime || undefined,
+          size: message.attachments[0].size || undefined,
+        }
+      : undefined;
 
   return {
     id: String(message._id),
     conversationId: String(message.conversationId),
     senderId,
     author: senderId === String(viewerId) ? 'you' : 'them',
-    body: message.body || '',
+    body: isDeleted ? '' : message.body || '',
     sentAt: message.createdAt
       ? new Date(message.createdAt).toISOString()
       : new Date().toISOString(),
+    editedAt: message.editedAt
+      ? new Date(message.editedAt).toISOString()
+      : null,
     clientMessageId: message.clientMessageId || undefined,
     attachment,
-    status: message.status === 'deleted' ? 'deleted' : 'sent',
+    status: isDeleted ? 'deleted' : 'sent',
   };
 }
 
@@ -169,16 +197,32 @@ function serializeMessage(message, viewerId) {
  * @param {object} conversation
  * @param {object} membership
  * @param {object} peer
+ * @param {{ peerLastReadAt?: string | null, memberCount?: number, role?: string }} extras
  */
-function serializeConversation(conversation, membership, peer) {
+function serializeConversation(conversation, membership, peer, extras = {}) {
+  const isGroup =
+    conversation.type === 'group' || conversation.kind === 'group';
+  const title = String(conversation.title || '').trim();
+  const displayName = isGroup
+    ? title || 'Group chat'
+    : peer?.name || 'Member';
+
   return {
     id: String(conversation._id),
-    peer,
-    name: peer.name,
-    username: peer.username,
-    headline: peer.headline,
-    kind: conversation.kind || 'person',
-    profilePhotoPath: peer.profilePhotoPath,
+    peer: isGroup ? undefined : peer,
+    name: displayName,
+    username: isGroup ? '' : peer?.username || '',
+    headline: isGroup
+      ? `${extras.memberCount || conversation.participantIds?.length || 0} members`
+      : peer?.headline || '',
+    kind: isGroup ? 'group' : conversation.kind || 'person',
+    type: isGroup ? 'group' : conversation.type || 'dm',
+    title: isGroup ? displayName : undefined,
+    memberCount: isGroup
+      ? extras.memberCount || conversation.participantIds?.length || 0
+      : undefined,
+    role: membership.role || 'member',
+    profilePhotoPath: isGroup ? null : peer?.profilePhotoPath,
     preview: conversation.lastMessagePreview || '',
     updatedAt: conversation.lastMessageAt
       ? new Date(conversation.lastMessageAt).toISOString()
@@ -190,8 +234,25 @@ function serializeConversation(conversation, membership, peer) {
     archived: Boolean(membership.archived),
     labeledMentors: Boolean(membership.labeledMentors),
     muted: Boolean(membership.muted),
-    online: peer.id ? presence.isOnline(peer.id) : false,
+    online: !isGroup && peer?.id ? presence.isOnline(peer.id) : false,
+    peerLastReadAt: extras.peerLastReadAt ?? null,
+    peerLastReadMessageId: extras.peerLastReadMessageId ?? null,
+    readReceiptsEnabled: extras.readReceiptsEnabled !== false,
+    availabilityStatus: isGroup
+      ? 'unset'
+      : peer?.availabilityStatus || 'unset',
+    availabilityLabel: isGroup ? '' : peer?.availabilityLabel || '',
   };
+}
+
+/**
+ * @param {string} userId
+ */
+async function userAllowsReadReceipts(userId) {
+  if (!userId) return true;
+  const prefs = await NotificationPrefs.findOne({ userId }).lean();
+  if (!prefs || prefs.readReceiptsEnabled === undefined) return true;
+  return Boolean(prefs.readReceiptsEnabled);
 }
 
 /**
@@ -268,11 +329,63 @@ class ChatService {
    * @param {string} viewerId
    */
   peerIdFromConversation(conversation, viewerId) {
+    if (conversation.type === 'group' || conversation.kind === 'group') {
+      return null;
+    }
     const viewer = String(viewerId);
     const peerId = conversation.participantIds
       .map((id) => String(id))
       .find((id) => id !== viewer);
     return peerId || null;
+  }
+
+  otherParticipantIds(conversation, viewerId) {
+    const viewer = String(viewerId);
+    return (conversation.participantIds || [])
+      .map((id) => String(id))
+      .filter((id) => id !== viewer);
+  }
+
+  /**
+   * Build conversation DTO with peer read cursor when privacy allows.
+   */
+  async toConversationDto(conversation, membership, viewerId) {
+    const isGroup =
+      conversation.type === 'group' || conversation.kind === 'group';
+    const viewerAllows = await userAllowsReadReceipts(viewerId);
+    let peer = serializePeer(null);
+    let peerLastReadAt = null;
+    let peerLastReadMessageId = null;
+
+    if (!isGroup) {
+      const peerId = this.peerIdFromConversation(conversation, viewerId);
+      const peers = await this.loadUsersById(peerId ? [peerId] : []);
+      peer = serializePeer(peerId ? peers.get(peerId) : null);
+      if (peerId && viewerAllows) {
+        const peerAllows = await userAllowsReadReceipts(peerId);
+        if (peerAllows) {
+          const peerMem = await ChatMembership.findOne({
+            conversationId: conversation._id,
+            userId: peerId,
+          })
+            .select('lastReadAt lastReadMessageId')
+            .lean();
+          peerLastReadAt = peerMem?.lastReadAt
+            ? new Date(peerMem.lastReadAt).toISOString()
+            : null;
+          peerLastReadMessageId = peerMem?.lastReadMessageId
+            ? String(peerMem.lastReadMessageId)
+            : null;
+        }
+      }
+    }
+
+    return serializeConversation(conversation, membership, peer, {
+      peerLastReadAt,
+      peerLastReadMessageId,
+      memberCount: conversation.participantIds?.length || 0,
+      readReceiptsEnabled: viewerAllows,
+    });
   }
 
   /**
@@ -284,7 +397,7 @@ class ChatService {
     const users = await User.find({
       _id: { $in: unique.map((id) => new mongoose.Types.ObjectId(id)) },
     }).select(
-      'fullName username role examGoal city profilePhotoPath officerPhotoPath instituteLogoPath instituteName',
+      'fullName username role examGoal city profilePhotoPath officerPhotoPath instituteLogoPath instituteName mentorAvailability',
     );
     const map = new Map();
     for (const user of users) {
@@ -344,6 +457,7 @@ class ChatService {
       .map((c) => this.peerIdFromConversation(c, user._id))
       .filter(Boolean);
     const peers = await this.loadUsersById(peerIds);
+    const viewerAllows = await userAllowsReadReceipts(user._id);
 
     const query = String(q || '')
       .trim()
@@ -351,20 +465,28 @@ class ChatService {
 
     const items = [];
     for (const conversation of rows) {
-      if (items.length >= take) break;
       const membership = membershipByConv.get(String(conversation._id));
       if (!membership) continue;
+      const isGroup =
+        conversation.type === 'group' || conversation.kind === 'group';
       const peerId = this.peerIdFromConversation(conversation, user._id);
-      const peerUser = peerId ? peers.get(peerId) : null;
-      const peer = serializePeer(peerUser);
+      const peer = serializePeer(peerId ? peers.get(peerId) : null);
+      const name = isGroup
+        ? String(conversation.title || '').trim() || 'Group chat'
+        : peer.name || '';
       if (query) {
-        const hay = `${peer.name} ${peer.username} ${peer.headline} ${conversation.lastMessagePreview || ''}`.toLowerCase();
+        const hay = `${name} ${peer.username || ''} ${peer.headline || ''}`.toLowerCase();
         if (!hay.includes(query)) continue;
       }
-      items.push(serializeConversation(conversation, membership, peer));
+      items.push(
+        serializeConversation(conversation, membership, peer, {
+          memberCount: conversation.participantIds?.length || 0,
+          readReceiptsEnabled: viewerAllows,
+        }),
+      );
     }
 
-    return { items, nextCursor: null };
+    return { items: items.slice(0, take), nextCursor: null };
   }
 
   /**
@@ -428,6 +550,7 @@ class ChatService {
       conversation = await ChatConversation.create({
         participantIds: [user._id, peer._id],
         participantKey: key,
+        type: 'dm',
         kind: conversationKindForRole(peer.role),
         lastMessageAt: new Date(),
         lastMessagePreview: '',
@@ -472,11 +595,101 @@ class ChatService {
       userId: user._id,
     });
 
-    return serializeConversation(
-      conversation,
-      membership,
-      serializePeer(peer),
+    return this.toConversationDto(conversation, membership, user._id);
+  }
+
+  /**
+   * Create a group chat (CHAT-D03) — optional community seed.
+   */
+  async createGroupConversation(
+    user,
+    { title, memberIds = [], communityId = null } = {},
+  ) {
+    const cleanTitle = String(title || '')
+      .trim()
+      .slice(0, 80);
+    if (!cleanTitle) {
+      throw new AppError('Group title is required', HTTP_STATUS.BAD_REQUEST, {
+        code: 'TITLE_REQUIRED',
+      });
+    }
+
+    const idSet = new Set([String(user._id)]);
+    for (const raw of memberIds) {
+      if (!mongoose.Types.ObjectId.isValid(raw)) continue;
+      const id = String(raw);
+      if (id !== String(user._id)) idSet.add(id);
+    }
+
+    let sourceCommunityId = null;
+    if (communityId) {
+      const cid = requireObjectId(communityId, 'communityId');
+      const membership = await CommunityMembership.findOne({
+        communityId: cid,
+        userId: user._id,
+      }).lean();
+      if (!membership) {
+        throw new AppError(
+          'Join the community before starting its group chat',
+          HTTP_STATUS.FORBIDDEN,
+          { code: 'NOT_COMMUNITY_MEMBER' },
+        );
+      }
+      sourceCommunityId = cid;
+      const communityMembers = await CommunityMembership.find({
+        communityId: cid,
+      })
+        .select('userId')
+        .limit(40)
+        .lean();
+      for (const row of communityMembers) {
+        idSet.add(String(row.userId));
+      }
+    }
+
+    const participantIds = [...idSet]
+      .slice(0, 50)
+      .map((id) => new mongoose.Types.ObjectId(id));
+
+    if (participantIds.length < 2) {
+      throw new AppError(
+        'Add at least one other member',
+        HTTP_STATUS.BAD_REQUEST,
+        { code: 'MEMBERS_REQUIRED' },
+      );
+    }
+
+    const groupKey = `group:${new mongoose.Types.ObjectId().toString()}`;
+    const conversation = await ChatConversation.create({
+      participantIds,
+      participantKey: groupKey,
+      type: 'group',
+      kind: 'group',
+      title: cleanTitle,
+      sourceCommunityId,
+      lastMessageAt: new Date(),
+      lastMessagePreview: '',
+      lastMessageSenderId: null,
+    });
+
+    await Promise.all(
+      participantIds.map((uid) =>
+        ChatMembership.create({
+          conversationId: conversation._id,
+          userId: uid,
+          role: String(uid) === String(user._id) ? 'owner' : 'member',
+          folder: 'focused',
+          unreadCount: 0,
+        }),
+      ),
     );
+
+    const membership = await ChatMembership.findOne({
+      conversationId: conversation._id,
+      userId: user._id,
+    });
+
+    return this.toConversationDto(conversation, membership, user._id);
   }
 
   /**
@@ -487,10 +700,7 @@ class ChatService {
       user,
       conversationId,
     );
-    const peerId = this.peerIdFromConversation(conversation, user._id);
-    const peers = await this.loadUsersById(peerId ? [peerId] : []);
-    const peer = serializePeer(peerId ? peers.get(peerId) : null);
-    return serializeConversation(conversation, membership, peer);
+    return this.toConversationDto(conversation, membership, user._id);
   }
 
   /**
@@ -506,7 +716,7 @@ class ChatService {
 
     const query = {
       conversationId: oid,
-      status: 'sent',
+      status: { $in: ['sent', 'deleted'] },
     };
 
     if (before && mongoose.Types.ObjectId.isValid(before)) {
@@ -528,6 +738,142 @@ class ChatService {
     return {
       items: page.map((row) => serializeMessage(row, user._id)),
       nextCursor: hasMore ? String(page[0]._id) : null,
+    };
+  }
+
+  /**
+   * Search message body + attachment names across the viewer's chats (CHAT-D04).
+   */
+  async searchMessages(
+    user,
+    { q = '', conversationId = null, cursor, limit } = {},
+  ) {
+    const query = String(q || '').trim();
+    if (query.length < 2) {
+      return { items: [], nextCursor: null, hasMore: false };
+    }
+
+    const take = Math.min(Math.max(Number(limit) || 20, 1), 50);
+    const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(escaped, 'i');
+
+    let conversationIds;
+    if (conversationId) {
+      await this.requireMembership(user, conversationId);
+      conversationIds = [requireObjectId(conversationId, 'conversationId')];
+    } else {
+      const memberships = await ChatMembership.find({
+        userId: user._id,
+        deletedForUserAt: null,
+      })
+        .select('conversationId')
+        .lean();
+      conversationIds = memberships.map((row) => row.conversationId);
+      if (!conversationIds.length) {
+        return { items: [], nextCursor: null, hasMore: false };
+      }
+    }
+
+    const filter = {
+      conversationId: { $in: conversationIds },
+      status: 'sent',
+      $or: [{ body: regex }, { 'attachments.name': regex }],
+    };
+
+    if (cursor && mongoose.Types.ObjectId.isValid(cursor)) {
+      filter._id = { $lt: new mongoose.Types.ObjectId(cursor) };
+    }
+
+    const rows = await ChatMessage.find(filter)
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(take + 1)
+      .lean();
+
+    const hasMore = rows.length > take;
+    const page = hasMore ? rows.slice(0, take) : rows;
+
+    const uniqueConvIds = [
+      ...new Set(page.map((row) => String(row.conversationId))),
+    ];
+    const conversations = uniqueConvIds.length
+      ? await ChatConversation.find({
+          _id: uniqueConvIds.map((id) => new mongoose.Types.ObjectId(id)),
+        }).lean()
+      : [];
+    const convMap = new Map(
+      conversations.map((doc) => [String(doc._id), doc]),
+    );
+
+    const memberships = uniqueConvIds.length
+      ? await ChatMembership.find({
+          userId: user._id,
+          conversationId: {
+            $in: uniqueConvIds.map((id) => new mongoose.Types.ObjectId(id)),
+          },
+        }).lean()
+      : [];
+    const memMap = new Map(
+      memberships.map((row) => [String(row.conversationId), row]),
+    );
+
+    const peerIds = [];
+    for (const conv of conversations) {
+      const peerId = this.peerIdFromConversation(conv, user._id);
+      if (peerId) peerIds.push(peerId);
+    }
+    const peers = await this.loadUsersById(peerIds);
+
+    const items = page.map((row) => {
+      const conv = convMap.get(String(row.conversationId));
+      const mem = memMap.get(String(row.conversationId));
+      const isGroup =
+        conv && (conv.type === 'group' || conv.kind === 'group');
+      const peerId = conv
+        ? this.peerIdFromConversation(conv, user._id)
+        : null;
+      const peer = peerId ? peers.get(peerId) : null;
+      const peerDto = serializePeer(peer);
+      const title = isGroup
+        ? String(conv?.title || '').trim() || 'Group chat'
+        : peerDto.name;
+
+      const bodyMatch = regex.test(String(row.body || ''));
+      const matchedAttachment = (row.attachments || []).find((att) =>
+        regex.test(String(att.name || '')),
+      );
+      const match = bodyMatch
+        ? 'body'
+        : matchedAttachment
+          ? 'attachment'
+          : 'body';
+      const snippet =
+        !bodyMatch && matchedAttachment
+          ? `📎 ${matchedAttachment.name}`
+          : truncatePreview(row.body, 140) ||
+            (matchedAttachment ? `📎 ${matchedAttachment.name}` : '');
+
+      return {
+        conversationId: String(row.conversationId),
+        conversation: {
+          id: String(row.conversationId),
+          name: title,
+          username: isGroup ? '' : peerDto.username || '',
+          kind: isGroup ? 'group' : conv?.kind || 'person',
+          type: isGroup ? 'group' : 'dm',
+          profilePhotoPath: isGroup ? null : peerDto.profilePhotoPath,
+          preview: mem ? conv?.lastMessagePreview || '' : '',
+        },
+        message: serializeMessage(row, user._id),
+        snippet,
+        match,
+        cursor: String(row._id),
+      };
+    });
+
+    return {
+      items,
+      nextCursor: hasMore ? String(page[page.length - 1]._id) : null,
+      hasMore,
     };
   }
 
@@ -642,11 +988,17 @@ class ChatService {
     membership.deletedForUserAt = null;
     await membership.save();
 
-    if (peerId) {
+    const otherIds = this.otherParticipantIds(conversation, user._id);
+    for (const oid of otherIds) {
+      try {
+        await this.assertNotBlocked(user._id, oid);
+      } catch {
+        continue;
+      }
       await ChatMembership.findOneAndUpdate(
         {
           conversationId: conversation._id,
-          userId: new mongoose.Types.ObjectId(peerId),
+          userId: new mongoose.Types.ObjectId(oid),
         },
         {
           $inc: { unreadCount: 1 },
@@ -663,7 +1015,6 @@ class ChatService {
     void this.emitMessageRealtime({
       conversation,
       senderId: String(user._id),
-      peerId,
       messageDoc: message,
       preview: storedPreview,
     });
@@ -672,85 +1023,264 @@ class ChatService {
   }
 
   /**
-   * Push message + inbox + unread events to both participants.
+   * Preview text from a message document.
    */
-  async emitMessageRealtime({
-    conversation,
-    senderId,
-    peerId,
-    messageDoc,
-    preview,
-  }) {
-    try {
-      const peers = await this.loadUsersById(
-        [senderId, peerId].filter(Boolean),
+  #previewFromMessage(message) {
+    if (!message || message.status === 'deleted') return '';
+    const text = String(message.body || '').trim();
+    if (text) return truncatePreview(text);
+    const att = Array.isArray(message.attachments) && message.attachments[0];
+    if (!att) return '';
+    return truncatePreview(
+      att.kind === 'gif' ? `GIF · ${att.name}` : `📎 ${att.name}`,
+    );
+  }
+
+  /**
+   * Recompute conversation last-message fields from newest sent message.
+   */
+  async #syncConversationPreview(conversation) {
+    const last = await ChatMessage.findOne({
+      conversationId: conversation._id,
+      status: 'sent',
+    })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    if (!last) {
+      conversation.lastMessagePreview = '';
+      conversation.lastMessageSenderId = null;
+    } else {
+      conversation.lastMessagePreview = this.#previewFromMessage(last);
+      conversation.lastMessageAt = last.createdAt;
+      conversation.lastMessageSenderId = last.senderId;
+    }
+    await conversation.save();
+    return conversation.lastMessagePreview || '';
+  }
+
+  async #requireOwnMessage(user, conversationId, messageId) {
+    const { membership, conversation } = await this.requireMembership(
+      user,
+      conversationId,
+    );
+    const oid = requireObjectId(messageId, 'messageId');
+    const message = await ChatMessage.findOne({
+      _id: oid,
+      conversationId: conversation._id,
+    });
+    if (!message) {
+      throw new AppError('Message not found', HTTP_STATUS.NOT_FOUND, {
+        code: 'MESSAGE_NOT_FOUND',
+      });
+    }
+    if (String(message.senderId) !== String(user._id)) {
+      throw new AppError(
+        'You can only change your own messages',
+        HTTP_STATUS.FORBIDDEN,
+        { code: 'NOT_MESSAGE_OWNER' },
       );
-      const senderUser = peers.get(String(senderId));
-      const peerUser = peerId ? peers.get(String(peerId)) : null;
+    }
+    return { membership, conversation, message };
+  }
 
-      const senderMembership = await ChatMembership.findOne({
+  /**
+   * Edit own message body (CHAT-D06).
+   */
+  async editMessage(user, conversationId, messageId, { body } = {}) {
+    const { conversation, message } = await this.#requireOwnMessage(
+      user,
+      conversationId,
+      messageId,
+    );
+
+    if (message.status === 'deleted') {
+      throw new AppError('Cannot edit a deleted message', HTTP_STATUS.BAD_REQUEST, {
+        code: 'MESSAGE_DELETED',
+      });
+    }
+
+    const text = String(body || '').trim();
+    if (!text && !(message.attachments && message.attachments.length)) {
+      throw new AppError('Message body is required', HTTP_STATUS.BAD_REQUEST, {
+        code: 'EMPTY_MESSAGE',
+      });
+    }
+    if (text.length > MAX_BODY) {
+      throw new AppError('Message is too long', HTTP_STATUS.BAD_REQUEST, {
+        code: 'MESSAGE_TOO_LONG',
+      });
+    }
+
+    message.body = text;
+    message.editedAt = new Date();
+    await message.save();
+
+    const preview = await this.#syncConversationPreview(conversation);
+    const payload = serializeMessage(message, user._id);
+    void this.emitMessageChangeRealtime({
+      conversation,
+      senderId: String(user._id),
+      messageDoc: message,
+      preview,
+      event: 'message:updated',
+    });
+    return payload;
+  }
+
+  /**
+   * Soft-delete own message (CHAT-D06).
+   */
+  async deleteMessage(user, conversationId, messageId) {
+    const { conversation, message } = await this.#requireOwnMessage(
+      user,
+      conversationId,
+      messageId,
+    );
+
+    if (message.status === 'deleted') {
+      return serializeMessage(message, user._id);
+    }
+
+    message.status = 'deleted';
+    await message.save();
+
+    const preview = await this.#syncConversationPreview(conversation);
+    const payload = serializeMessage(message, user._id);
+    void this.emitMessageChangeRealtime({
+      conversation,
+      senderId: String(user._id),
+      messageDoc: message,
+      preview,
+      event: 'message:deleted',
+    });
+    return payload;
+  }
+
+  /**
+   * Push message + inbox + unread events to all participants.
+   */
+  async emitMessageRealtime({ conversation, senderId, messageDoc, preview }) {
+    try {
+      const participantIds = (conversation.participantIds || []).map(String);
+      const users = await this.loadUsersById(participantIds);
+      const memberships = await ChatMembership.find({
         conversationId: conversation._id,
-        userId: senderId,
+        userId: { $in: participantIds.map((id) => new mongoose.Types.ObjectId(id)) },
       }).lean();
-      const peerMembership = peerId
-        ? await ChatMembership.findOne({
-            conversationId: conversation._id,
-            userId: peerId,
-          }).lean()
-        : null;
+      const memByUser = new Map(
+        memberships.map((m) => [String(m.userId), m]),
+      );
 
-      if (senderMembership) {
-        const senderView = serializeConversation(
-          conversation,
-          senderMembership,
-          serializePeer(peerUser),
-        );
-        emitToUser(senderId, 'message:new', {
-          conversationId: String(conversation._id),
-          message: serializeMessage(messageDoc, senderId),
-        });
-        emitToUser(senderId, 'conversation:updated', {
-          conversation: senderView,
-        });
-        const senderUnread = await this.unreadCount({
-          _id: new mongoose.Types.ObjectId(senderId),
-        });
-        emitToUser(senderId, 'unread:total', senderUnread);
-      }
+      for (const participantId of participantIds) {
+        const membership = memByUser.get(participantId);
+        if (!membership) continue;
 
-      if (peerId && peerMembership) {
-        try {
-          await this.assertNotBlocked(senderId, peerId);
-        } catch {
-          return;
+        if (participantId !== String(senderId)) {
+          try {
+            await this.assertNotBlocked(senderId, participantId);
+          } catch {
+            continue;
+          }
         }
-        const peerView = serializeConversation(
-          conversation,
-          peerMembership,
-          serializePeer(senderUser),
-        );
-        // Ensure preview reflects latest (membership may be lean stale on unread)
-        peerView.preview = preview || peerView.preview;
-        peerView.updatedAt = conversation.lastMessageAt
-          ? new Date(conversation.lastMessageAt).toISOString()
-          : peerView.updatedAt;
 
-        emitToUser(peerId, 'message:new', {
+        const peerId = this.peerIdFromConversation(conversation, participantId);
+        const peerUser = peerId ? users.get(peerId) : null;
+        const view = serializeConversation(
+          conversation,
+          membership,
+          serializePeer(peerUser),
+          {
+            memberCount: participantIds.length,
+          },
+        );
+        view.preview = preview || view.preview;
+        view.updatedAt = conversation.lastMessageAt
+          ? new Date(conversation.lastMessageAt).toISOString()
+          : view.updatedAt;
+
+        emitToUser(participantId, 'message:new', {
           conversationId: String(conversation._id),
-          message: serializeMessage(messageDoc, peerId),
+          message: serializeMessage(messageDoc, participantId),
         });
-        emitToUser(peerId, 'conversation:updated', {
-          conversation: peerView,
+        emitToUser(participantId, 'conversation:updated', {
+          conversation: view,
         });
-        const peerUnread = await this.unreadCount({
-          _id: new mongoose.Types.ObjectId(peerId),
+        const total = await this.unreadCount({
+          _id: new mongoose.Types.ObjectId(participantId),
         });
-        emitToUser(peerId, 'unread:total', peerUnread);
+        emitToUser(participantId, 'unread:total', total);
       }
     } catch (err) {
       // Realtime must never break send.
       const { logger } = require('../../common/utils/logger');
       logger.warn('Chat realtime emit failed', {
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Push edit/delete + conversation preview updates.
+   */
+  async emitMessageChangeRealtime({
+    conversation,
+    senderId,
+    messageDoc,
+    preview,
+    event,
+  }) {
+    try {
+      const participantIds = (conversation.participantIds || []).map(String);
+      const users = await this.loadUsersById(participantIds);
+      const memberships = await ChatMembership.find({
+        conversationId: conversation._id,
+        userId: {
+          $in: participantIds.map((id) => new mongoose.Types.ObjectId(id)),
+        },
+      }).lean();
+      const memByUser = new Map(
+        memberships.map((m) => [String(m.userId), m]),
+      );
+
+      for (const participantId of participantIds) {
+        const membership = memByUser.get(participantId);
+        if (!membership) continue;
+
+        if (participantId !== String(senderId)) {
+          try {
+            await this.assertNotBlocked(senderId, participantId);
+          } catch {
+            continue;
+          }
+        }
+
+        const peerId = this.peerIdFromConversation(conversation, participantId);
+        const peerUser = peerId ? users.get(peerId) : null;
+        const view = serializeConversation(
+          conversation,
+          membership,
+          serializePeer(peerUser),
+          {
+            memberCount: participantIds.length,
+          },
+        );
+        view.preview = preview || view.preview;
+        view.updatedAt = conversation.lastMessageAt
+          ? new Date(conversation.lastMessageAt).toISOString()
+          : view.updatedAt;
+
+        emitToUser(participantId, event, {
+          conversationId: String(conversation._id),
+          message: serializeMessage(messageDoc, participantId),
+        });
+        emitToUser(participantId, 'conversation:updated', {
+          conversation: view,
+        });
+      }
+    } catch (err) {
+      const { logger } = require('../../common/utils/logger');
+      logger.warn('Chat realtime change emit failed', {
         message: err instanceof Error ? err.message : String(err),
       });
     }
@@ -777,12 +1307,10 @@ class ChatService {
     if (last) membership.lastReadMessageId = last._id;
     await membership.save();
 
-    const peerId = this.peerIdFromConversation(conversation, user._id);
-    const peers = await this.loadUsersById(peerId ? [peerId] : []);
-    const summary = serializeConversation(
+    const summary = await this.toConversationDto(
       conversation,
       membership,
-      serializePeer(peerId ? peers.get(peerId) : null),
+      user._id,
     );
 
     try {
@@ -791,6 +1319,23 @@ class ChatService {
       });
       const total = await this.unreadCount(user);
       emitToUser(String(user._id), 'unread:total', total);
+
+      const readerAllows = await userAllowsReadReceipts(user._id);
+      if (readerAllows) {
+        const others = this.otherParticipantIds(conversation, user._id);
+        for (const peerId of others) {
+          const peerAllows = await userAllowsReadReceipts(peerId);
+          if (!peerAllows) continue;
+          emitToUser(peerId, 'message:read', {
+            conversationId: String(conversation._id),
+            readerId: String(user._id),
+            lastReadAt: membership.lastReadAt.toISOString(),
+            lastReadMessageId: membership.lastReadMessageId
+              ? String(membership.lastReadMessageId)
+              : null,
+          });
+        }
+      }
     } catch {
       // ignore realtime errors
     }
@@ -832,14 +1377,7 @@ class ChatService {
     }
 
     await membership.save();
-
-    const peerId = this.peerIdFromConversation(conversation, user._id);
-    const peers = await this.loadUsersById(peerId ? [peerId] : []);
-    return serializeConversation(
-      conversation,
-      membership,
-      serializePeer(peerId ? peers.get(peerId) : null),
-    );
+    return this.toConversationDto(conversation, membership, user._id);
   }
 
   /**

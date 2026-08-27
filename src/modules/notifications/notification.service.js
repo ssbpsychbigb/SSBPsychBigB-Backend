@@ -4,9 +4,15 @@ const mongoose = require('mongoose');
 const { AppError } = require('../../common/errors/AppError');
 const { HTTP_STATUS } = require('../../common/constants/httpStatus');
 const { Notification } = require('./notification.model');
+const {
+  NotificationPrefs,
+  DEFAULT_CATEGORIES,
+} = require('./notification-prefs.model');
 const { Follow } = require('../feed/follow.model');
 const { User } = require('../auth/user.model');
+const { ACCOUNT_STATUS } = require('../auth/auth.constants');
 const { logger } = require('../../common/utils/logger');
+const pushService = require('./push.service');
 
 const EXAM_LABELS = {
   nda: 'NDA',
@@ -32,6 +38,7 @@ const HEADLINES = {
   reminder: 'reminder',
   course: 'published a course',
   assessment: 'published an assessment',
+  moderation: 'moderation update',
 };
 
 const CATEGORIES = {
@@ -45,7 +52,74 @@ const CATEGORIES = {
   reminder: 'learning',
   course: 'learning',
   assessment: 'learning',
+  moderation: 'alerts',
 };
+
+function categoryForKind(kind, meta = {}) {
+  if (kind === 'broadcast' && meta.communitySlug) return 'community';
+  return CATEGORIES[kind] || 'alerts';
+}
+
+function parseHm(value, fallbackMinutes) {
+  const match = String(value || '').match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return fallbackMinutes;
+  const h = Number(match[1]);
+  const m = Number(match[2]);
+  if (h > 23 || m > 59) return fallbackMinutes;
+  return h * 60 + m;
+}
+
+/**
+ * Quiet hours in a timezone (Asia/Kolkata default). Supports overnight ranges.
+ */
+function isInQuietHours(prefs, now = new Date()) {
+  const qh = prefs?.quietHours;
+  if (!qh?.enabled) return false;
+  const tz = qh.timezone || 'Asia/Kolkata';
+  let parts;
+  try {
+    parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: tz,
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(now);
+  } catch {
+    parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kolkata',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(now);
+  }
+  const hour = Number(parts.find((p) => p.type === 'hour')?.value || 0);
+  const minute = Number(parts.find((p) => p.type === 'minute')?.value || 0);
+  const current = hour * 60 + minute;
+  const start = parseHm(qh.start, 22 * 60);
+  const end = parseHm(qh.end, 7 * 60);
+  if (start === end) return true;
+  if (start < end) return current >= start && current < end;
+  return current >= start || current < end;
+}
+
+function serializePrefs(doc) {
+  const categories = { ...DEFAULT_CATEGORIES, ...(doc?.categories || {}) };
+  return {
+    categories,
+    quietHours: {
+      enabled: Boolean(doc?.quietHours?.enabled),
+      start: doc?.quietHours?.start || '22:00',
+      end: doc?.quietHours?.end || '07:00',
+      timezone: doc?.quietHours?.timezone || 'Asia/Kolkata',
+    },
+    pushEnabled: Boolean(doc?.pushEnabled),
+    pushConfigured: pushService.isPushConfigured(),
+    readReceiptsEnabled:
+      doc?.readReceiptsEnabled === undefined
+        ? true
+        : Boolean(doc.readReceiptsEnabled),
+  };
+}
 
 function actorKind(role) {
   if (role === 'institute') return 'institute';
@@ -97,6 +171,63 @@ function serializeItem(doc, actor, followingAuthor) {
     };
   }
 
+  if (kind === 'moderation') {
+    const postHref =
+      doc.entityType === 'post' && doc.entityId
+        ? `/posts/${doc.entityId}`
+        : '/notifications';
+    return {
+      id: String(doc._id),
+      kind: 'moderation',
+      category: 'alerts',
+      actors: [{ name: 'BIGB Moderation', kind: 'system' }],
+      headline: meta.headline || 'A moderator took action on your content',
+      detail: excerpt(meta.excerpt || '') || undefined,
+      createdAt,
+      unread: Boolean(doc.unread),
+      href: postHref,
+      actions: [],
+    };
+  }
+
+  if (kind === 'broadcast' && meta.systemBroadcast) {
+    return {
+      id: String(doc._id),
+      kind: 'broadcast',
+      category: 'alerts',
+      actors: [{ name: 'BIGB', kind: 'system' }],
+      headline: meta.headline || 'Announcement from BIGB',
+      detail: excerpt(meta.excerpt || '') || undefined,
+      createdAt,
+      unread: Boolean(doc.unread),
+      href: meta.href || '/notifications',
+      actions: [],
+    };
+  }
+
+  if (kind === 'broadcast' && meta.communitySlug) {
+    const communityName = meta.communityName || meta.communitySlug;
+    return {
+      id: String(doc._id),
+      kind: 'broadcast',
+      category: 'community',
+      actors: [
+        {
+          id: actor?._id ? String(actor._id) : undefined,
+          name: actor?.fullName || 'Moderator',
+          username: actor?.username || '',
+          kind: 'person',
+        },
+      ],
+      headline: `announced in ${communityName}`,
+      detail: excerpt(meta.excerpt || '') || undefined,
+      createdAt,
+      unread: Boolean(doc.unread),
+      href: `/c/${meta.communitySlug}`,
+      actions: [],
+    };
+  }
+
   const isFollow = kind === 'follow';
   const postId = !isFollow && doc.entityId ? String(doc.entityId) : null;
   const detail = isFollow ? actorDetail(actor) : excerpt(meta.excerpt || '');
@@ -106,7 +237,7 @@ function serializeItem(doc, actor, followingAuthor) {
   return {
     id: String(doc._id),
     kind,
-    category: CATEGORIES[kind] || 'alerts',
+    category: categoryForKind(kind, meta),
     actors: [
       {
         id: String(actor._id),
@@ -132,11 +263,15 @@ function serializeItem(doc, actor, followingAuthor) {
  */
 class NotificationService {
   /**
-   * Insert one in-app notification. Skips self and unread dupes in 24h.
+   * Insert one in-app notification. Skips self, prefs-off categories, and unread dupes in 24h.
    */
   async notify({ actor, recipientId, kind, entityType, entityId, meta = {} }) {
     if (!actor?._id || !recipientId || !kind) return null;
     if (String(actor._id) === String(recipientId)) return null;
+
+    const prefs = await this.getPrefsDoc(recipientId);
+    const category = categoryForKind(kind, meta);
+    if (prefs.categories?.[category] === false) return null;
 
     const since = new Date(Date.now() - DEDUPE_MS);
     const filter = {
@@ -152,7 +287,7 @@ class NotificationService {
     const existing = await Notification.findOne(filter).select('_id');
     if (existing) return existing;
 
-    return Notification.create({
+    const created = await Notification.create({
       recipientId,
       actorId: actor._id,
       kind,
@@ -161,6 +296,284 @@ class NotificationService {
       unread: true,
       meta,
     });
+
+    await this.safe(() => this.#maybePush(recipientId, created, prefs, actor));
+    return created;
+  }
+
+  async getPrefsDoc(userId) {
+    const doc = await NotificationPrefs.findOne({ userId }).lean();
+    if (!doc) {
+      return {
+        categories: { ...DEFAULT_CATEGORIES },
+        quietHours: {
+          enabled: false,
+          start: '22:00',
+          end: '07:00',
+          timezone: 'Asia/Kolkata',
+        },
+        pushEnabled: false,
+        readReceiptsEnabled: true,
+      };
+    }
+    return {
+      categories: { ...DEFAULT_CATEGORIES, ...(doc.categories || {}) },
+      quietHours: doc.quietHours || {
+        enabled: false,
+        start: '22:00',
+        end: '07:00',
+        timezone: 'Asia/Kolkata',
+      },
+      pushEnabled: Boolean(doc.pushEnabled),
+      readReceiptsEnabled:
+        doc.readReceiptsEnabled === undefined
+          ? true
+          : Boolean(doc.readReceiptsEnabled),
+    };
+  }
+
+  async getPreferences(userId) {
+    const doc = await NotificationPrefs.findOne({ userId }).lean();
+    return serializePrefs(doc);
+  }
+
+  async updatePreferences(userId, body = {}) {
+    const current = await this.getPreferences(userId);
+    const nextCategories = { ...current.categories };
+    if (body.categories && typeof body.categories === 'object') {
+      for (const key of Object.keys(DEFAULT_CATEGORIES)) {
+        if (typeof body.categories[key] === 'boolean') {
+          nextCategories[key] = body.categories[key];
+        }
+      }
+    }
+
+    const quietHours = { ...current.quietHours };
+    if (body.quietHours && typeof body.quietHours === 'object') {
+      if (typeof body.quietHours.enabled === 'boolean') {
+        quietHours.enabled = body.quietHours.enabled;
+      }
+      if (typeof body.quietHours.start === 'string' && /^\d{1,2}:\d{2}$/.test(body.quietHours.start)) {
+        quietHours.start = body.quietHours.start;
+      }
+      if (typeof body.quietHours.end === 'string' && /^\d{1,2}:\d{2}$/.test(body.quietHours.end)) {
+        quietHours.end = body.quietHours.end;
+      }
+      if (typeof body.quietHours.timezone === 'string' && body.quietHours.timezone.trim()) {
+        quietHours.timezone = body.quietHours.timezone.trim().slice(0, 64);
+      }
+    }
+
+    const pushEnabled =
+      typeof body.pushEnabled === 'boolean'
+        ? body.pushEnabled
+        : current.pushEnabled;
+
+    const readReceiptsEnabled =
+      typeof body.readReceiptsEnabled === 'boolean'
+        ? body.readReceiptsEnabled
+        : current.readReceiptsEnabled !== false;
+
+    const doc = await NotificationPrefs.findOneAndUpdate(
+      { userId },
+      {
+        $set: {
+          userId,
+          categories: nextCategories,
+          quietHours,
+          pushEnabled,
+          readReceiptsEnabled,
+        },
+      },
+      { upsert: true, new: true },
+    ).lean();
+
+    return serializePrefs(doc);
+  }
+
+  /**
+   * Platform admin broadcast → filtered app users (NOTIF-S04).
+   */
+  async adminBroadcast({
+    message,
+    headline = 'Announcement from BIGB',
+    href = '/notifications',
+    audience = 'all',
+    role = null,
+    examGoal = null,
+    actorUserId = null,
+  }) {
+    const excerptText = excerpt(message, 280);
+    if (!excerptText) {
+      throw new AppError('Broadcast message is required', HTTP_STATUS.BAD_REQUEST, {
+        code: 'EMPTY_BROADCAST',
+      });
+    }
+
+    const filter = { accountStatus: ACCOUNT_STATUS.ACTIVE };
+    if (audience === 'role' && role) {
+      filter.role = String(role).trim();
+    }
+    if (audience === 'exam' && examGoal) {
+      filter.examGoal = String(examGoal).trim().toLowerCase();
+    }
+
+    const users = await User.find(filter).select('_id').lean();
+    if (!users.length) {
+      return { sent: 0 };
+    }
+
+    const prefsRows = await NotificationPrefs.find({
+      userId: { $in: users.map((u) => u._id) },
+    }).lean();
+    const prefsByUser = new Map(
+      prefsRows.map((row) => [String(row.userId), row]),
+    );
+
+    const actorId =
+      actorUserId && mongoose.Types.ObjectId.isValid(actorUserId)
+        ? actorUserId
+        : users[0]._id;
+
+    const docs = [];
+    for (const user of users) {
+      const raw = prefsByUser.get(String(user._id));
+      const categories = { ...DEFAULT_CATEGORIES, ...(raw?.categories || {}) };
+      if (categories.alerts === false) continue;
+      docs.push({
+        recipientId: user._id,
+        actorId,
+        kind: 'broadcast',
+        entityType: 'system',
+        entityId: user._id,
+        unread: true,
+        meta: {
+          systemBroadcast: true,
+          headline,
+          excerpt: excerptText,
+          href: href || '/notifications',
+        },
+      });
+    }
+
+    const chunk = 250;
+    for (let i = 0; i < docs.length; i += chunk) {
+      // eslint-disable-next-line no-await-in-loop
+      await Notification.insertMany(docs.slice(i, i + chunk), { ordered: false });
+    }
+
+    // Push a sample of users (respect quiet hours) — batch soft-send
+    for (const doc of docs.slice(0, 200)) {
+      // eslint-disable-next-line no-await-in-loop
+      await this.safe(async () => {
+        const prefs = await this.getPrefsDoc(doc.recipientId);
+        if (!prefs.pushEnabled || isInQuietHours(prefs)) return;
+        await pushService.sendToUser(doc.recipientId, {
+          title: headline,
+          body: excerptText,
+          href: href || '/notifications',
+        });
+      });
+    }
+
+    return { sent: docs.length, audience, matchedUsers: users.length };
+  }
+
+  /**
+   * Community announcement → all members (NOTIF-S05).
+   */
+  async notifyCommunityAnnouncement({ actor, post, community }) {
+    if (!actor?._id || !post?._id || !community?._id) return null;
+
+    const { CommunityMembership } = require('../community/community.model');
+    const members = await CommunityMembership.find({
+      communityId: community._id,
+    })
+      .select('userId')
+      .lean();
+
+    const skip = new Set([String(actor._id)]);
+    const recipientIds = [
+      ...new Set(members.map((m) => String(m.userId))),
+    ].filter((id) => !skip.has(id) && mongoose.Types.ObjectId.isValid(id));
+
+    if (!recipientIds.length) return { sent: 0 };
+
+    const prefsRows = await NotificationPrefs.find({
+      userId: { $in: recipientIds },
+    }).lean();
+    const prefsByUser = new Map(
+      prefsRows.map((row) => [String(row.userId), row]),
+    );
+
+    const excerptText =
+      excerpt(post.content) || `New announcement in ${community.name}`;
+    const postId = post._id || post.id;
+    const docs = [];
+    for (const recipientId of recipientIds) {
+      const raw = prefsByUser.get(String(recipientId));
+      const categories = { ...DEFAULT_CATEGORIES, ...(raw?.categories || {}) };
+      if (categories.community === false) continue;
+      docs.push({
+        recipientId,
+        actorId: actor._id,
+        kind: 'broadcast',
+        entityType: 'post',
+        entityId: postId,
+        unread: true,
+        meta: {
+          excerpt: excerptText,
+          communitySlug: community.slug,
+          communityName: community.name,
+          communityId: String(community._id),
+        },
+      });
+    }
+
+    const chunk = 250;
+    for (let i = 0; i < docs.length; i += chunk) {
+      // eslint-disable-next-line no-await-in-loop
+      await Notification.insertMany(docs.slice(i, i + chunk), { ordered: false });
+    }
+
+    for (const doc of docs.slice(0, 100)) {
+      // eslint-disable-next-line no-await-in-loop
+      await this.safe(async () => {
+        const prefs = await this.getPrefsDoc(doc.recipientId);
+        if (!prefs.pushEnabled || isInQuietHours(prefs)) return;
+        await pushService.sendToUser(doc.recipientId, {
+          title: community.name,
+          body: excerptText,
+          href: `/c/${community.slug}`,
+        });
+      });
+    }
+
+    return { sent: docs.length };
+  }
+
+  async #maybePush(recipientId, notification, prefs, actor) {
+    if (!prefs?.pushEnabled || isInQuietHours(prefs)) return;
+    if (!pushService.isPushConfigured()) return;
+
+    const meta = notification.meta || {};
+    const title =
+      meta.headline ||
+      actor?.fullName ||
+      actor?.instituteName ||
+      'BIGB';
+    const body =
+      HEADLINES[notification.kind] ||
+      excerpt(meta.excerpt) ||
+      'You have a new notification';
+    const href =
+      notification.kind === 'follow'
+        ? `/u/${actor?.username || ''}`
+        : notification.entityType === 'post' && notification.entityId
+          ? `/posts/${notification.entityId}`
+          : '/notifications';
+
+    await pushService.sendToUser(recipientId, { title, body, href });
   }
 
   async notifyFollow({ actor, recipientId }) {
@@ -321,6 +734,34 @@ class NotificationService {
   }
 
   /**
+   * System notice after a moderator action (hide / warn / lock / remove comment).
+   */
+  async notifyModeration({ recipientId, action, postId = null, excerptText = '' }) {
+    if (!recipientId || !action) return null;
+
+    const headlines = {
+      hide: 'A moderator hid your post',
+      warn: 'You received a community warning',
+      comment_removed: 'A moderator removed your comment',
+      lock_comments: 'Comments were locked on your post',
+    };
+
+    return Notification.create({
+      recipientId,
+      actorId: recipientId,
+      kind: 'moderation',
+      entityType: postId ? 'post' : 'user',
+      entityId: postId || recipientId,
+      unread: true,
+      meta: {
+        action,
+        excerpt: excerpt(excerptText),
+        headline: headlines[action] || 'A moderator took action on your content',
+      },
+    });
+  }
+
+  /**
    * Attempt-date reminder (7-day window). One per week.
    */
   async ensureAttemptReminder(user) {
@@ -423,7 +864,7 @@ class NotificationService {
       .map((row) => {
         const actor = actorMap.get(String(row.actorId));
         if (!HEADLINES[row.kind]) return null;
-        if (row.kind !== 'reminder' && !actor) return null;
+        if (row.kind !== 'reminder' && row.kind !== 'moderation' && !actor) return null;
         return serializeItem(
           row,
           actor,

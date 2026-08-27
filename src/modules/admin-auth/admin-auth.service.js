@@ -17,6 +17,13 @@ const {
  */
 function toPublicAdmin(adminDoc) {
   const json = adminDoc.toJSON();
+  const defaults = ROLE_DEFAULT_PERMISSIONS[json.role] || [];
+  const stored = Array.isArray(json.permissions) ? json.permissions : [];
+  const permissions =
+    json.role === ADMIN_ROLES.SUPER_ADMIN
+      ? [...defaults]
+      : [...new Set([...defaults, ...stored])];
+
   return {
     id: json.id,
     loginId: json.loginId,
@@ -26,7 +33,7 @@ function toPublicAdmin(adminDoc) {
     role: json.role,
     accountStatus: json.accountStatus,
     portal: json.portal,
-    permissions: json.permissions || [],
+    permissions,
     customRoleId: json.customRoleId ? String(json.customRoleId) : undefined,
     lastLoginAt: json.lastLoginAt,
     createdAt: json.createdAt,
