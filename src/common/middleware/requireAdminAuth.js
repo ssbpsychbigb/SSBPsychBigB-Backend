@@ -38,6 +38,43 @@ function requireAdminAuth(req, _res, next) {
 }
 
 /**
+ * Loads `req.admin` and requires Super Admin role.
+ * Must run after `requireAdminAuth`.
+ *
+ * @type {import('express').RequestHandler}
+ */
+async function requireSuperAdmin(req, _res, next) {
+  try {
+    if (!req.auth?.sub) {
+      throw new AppError('Admin authentication required', HTTP_STATUS.UNAUTHORIZED, {
+        code: 'UNAUTHORIZED',
+      });
+    }
+
+    const { AdminUser } = require('../../modules/admin-auth/admin-user.model');
+    const { ADMIN_ROLES } = require('../../modules/auth/auth.constants');
+
+    const admin = await AdminUser.findById(req.auth.sub);
+    if (!admin) {
+      throw new AppError('Admin not found', HTTP_STATUS.UNAUTHORIZED, {
+        code: 'UNAUTHORIZED',
+      });
+    }
+
+    if (admin.role !== ADMIN_ROLES.SUPER_ADMIN) {
+      throw new AppError('Only super admin can perform this action', HTTP_STATUS.FORBIDDEN, {
+        code: 'SUPER_ADMIN_REQUIRED',
+      });
+    }
+
+    req.admin = admin;
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+}
+
+/**
  * Requires one of the listed admin permission codes (or super_admin via grants).
  *
  * @param {...string} permissionCodes
@@ -89,4 +126,4 @@ function requireAdminPermission(...permissionCodes) {
   };
 }
 
-module.exports = { requireAdminAuth, requireAdminPermission };
+module.exports = { requireAdminAuth, requireAdminPermission, requireSuperAdmin };

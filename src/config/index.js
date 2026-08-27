@@ -79,6 +79,10 @@ const config = Object.freeze({
   upload: Object.freeze({
     dir: required('UPLOAD_DIR', 'uploads'),
     maxFileBytes: Number(required('UPLOAD_MAX_BYTES', String(5 * 1024 * 1024))),
+    /** Feed video MVP — 250 MB (§4.5). */
+    feedVideoMaxBytes: Number(
+      process.env.FEED_VIDEO_MAX_BYTES || String(250 * 1024 * 1024),
+    ),
   }),
   features: Object.freeze({
     /**

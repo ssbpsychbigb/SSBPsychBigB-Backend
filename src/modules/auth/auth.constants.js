@@ -132,7 +132,8 @@ const ADMIN_PERMISSION_META = Object.freeze({
   },
   [ADMIN_PERMISSIONS.MODERATION]: {
     label: 'Content moderation',
-    description: 'Hide posts, review reports, warn users (feed tools).',
+    description:
+      'Review reports, hide posts, warn users, lock comments, and moderate community content.',
     group: 'Moderation',
   },
   [ADMIN_PERMISSIONS.NOTIFICATIONS_MANAGE]: {
@@ -311,6 +312,7 @@ const ROLE_DEFAULT_PERMISSIONS = Object.freeze({
     ADMIN_PERMISSIONS.EDUCATOR_VERIFY,
     ADMIN_PERMISSIONS.USERS_READ,
     ADMIN_PERMISSIONS.USERS_MANAGE,
+    ADMIN_PERMISSIONS.MODERATION,
     ADMIN_PERMISSIONS.NOTIFICATIONS_MANAGE,
   ],
   [ADMIN_ROLES.PLATFORM_MODERATOR]: [
