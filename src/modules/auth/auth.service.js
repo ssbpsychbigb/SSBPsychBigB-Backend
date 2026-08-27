@@ -224,14 +224,32 @@ async function issueOtpChallenge({ mobileNumber, purpose }) {
   const otpHash = await hashOtp(otp);
   const expiresAt = new Date(Date.now() + config.otp.ttlSeconds * 1000);
 
-  await OtpChallenge.deleteMany({ mobileNumber, purpose });
+  const challenge = await OtpChallenge.findOneAndUpdate(
+    { mobileNumber, purpose },
+    {
+      $set: {
+        otpHash,
+        expiresAt,
+        attempts: 0,
+        maxAttempts: 5,
+        consumedAt: null,
+      },
+      $setOnInsert: {
+        mobileNumber,
+        purpose,
+      },
+    },
+    { upsert: true, new: true, sort: { createdAt: -1 } },
+  );
 
-  await OtpChallenge.create({
-    mobileNumber,
-    purpose,
-    otpHash,
-    expiresAt,
-  });
+  // * Best-effort cleanup of older duplicates (non-blocking).
+  if (challenge?._id) {
+    void OtpChallenge.deleteMany({
+      mobileNumber,
+      purpose,
+      _id: { $ne: challenge._id },
+    }).catch(() => {});
+  }
 
   logger.info('OTP issued', {
     mobileNumber,
@@ -466,20 +484,30 @@ class AuthService {
         purpose: OTP_PURPOSE.REGISTER,
       });
 
-      const mailResult = await mailService.notifyRegistrationReceived({
-        to: email,
-        name: fullName,
-        roleLabel: roleLabel(role),
-        otp: otpPayload.otp,
-      });
+      const willEmail = Boolean(email);
+      if (willEmail) {
+        void mailService
+          .notifyRegistrationReceived({
+            to: email,
+            name: fullName,
+            roleLabel: roleLabel(role),
+            otp: otpPayload.otp,
+          })
+          .catch((error) => {
+            logger.error('Registration OTP email failed', {
+              mobileNumber,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+      }
 
       const { otp: _otp, ...clientOtp } = otpPayload;
 
       return {
         ...clientOtp,
         joinType,
-        emailSent: Boolean(mailResult?.sent),
-        message: mailResult?.sent
+        emailSent: willEmail,
+        message: willEmail
           ? 'Account created. Check your email for the OTP.'
           : 'Account created. Verify OTP to continue.',
       };
@@ -492,21 +520,32 @@ class AuthService {
       purpose: OTP_PURPOSE.REGISTER,
     });
 
-    const mailResult = await mailService.notifyRegistrationReceived({
-      to: email,
-      name:
-        String(profile.fullName || profile.instituteName || '').trim() || 'there',
-      roleLabel: roleLabel(role),
-      otp: otpPayload.otp,
-    });
+    const willEmail = Boolean(email);
+    if (willEmail) {
+      void mailService
+        .notifyRegistrationReceived({
+          to: email,
+          name:
+            String(profile.fullName || profile.instituteName || '').trim() ||
+            'there',
+          roleLabel: roleLabel(role),
+          otp: otpPayload.otp,
+        })
+        .catch((error) => {
+          logger.error('Registration OTP email failed', {
+            mobileNumber,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+    }
 
     const { otp: _otp, ...clientOtp } = otpPayload;
 
     return {
       ...clientOtp,
       joinType,
-      emailSent: Boolean(mailResult?.sent),
-      message: mailResult?.sent
+      emailSent: willEmail,
+      message: willEmail
         ? 'Account created. Check your email for the OTP.'
         : 'Account created. Verify OTP to continue.',
     };
@@ -550,22 +589,30 @@ class AuthService {
       purpose,
     });
 
-    let emailSent = false;
-    if (user.email) {
-      const mailResult = await mailService.notifyOtpCode({
-        to: user.email,
-        name: user.fullName || user.instituteName || 'there',
-        otp: otpPayload.otp,
-        purpose,
-      });
-      emailSent = Boolean(mailResult?.sent);
+    // * Don't block the HTTP response on SMTP (main Render latency source).
+    const emailQueued = Boolean(user.email);
+    if (emailQueued) {
+      void mailService
+        .notifyOtpCode({
+          to: user.email,
+          name: user.fullName || user.instituteName || 'there',
+          otp: otpPayload.otp,
+          purpose,
+        })
+        .catch((error) => {
+          logger.error('OTP email failed', {
+            mobileNumber,
+            purpose,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
     }
 
     const { otp: _otp, ...clientOtp } = otpPayload;
     return {
       ...clientOtp,
-      emailSent,
-      message: emailSent
+      emailSent: emailQueued,
+      message: emailQueued
         ? 'OTP sent to your registered email.'
         : 'OTP generated. Check the app for the code while SMS is offline.',
     };

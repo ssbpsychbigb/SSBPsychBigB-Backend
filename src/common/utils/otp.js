@@ -15,22 +15,46 @@ function generateOtpCode() {
 }
 
 /**
+ * Fast HMAC digest for short-lived OTPs (avoids bcrypt CPU on Render).
+ * @param {string} otp
+ * @returns {string}
+ */
+function hmacOtp(otp) {
+  return crypto
+    .createHmac('sha256', config.jwt.secret)
+    .update(`otp:${String(otp)}`)
+    .digest('hex');
+}
+
+/**
  * Hashes an OTP for at-rest storage.
  * @param {string} otp
  * @returns {Promise<string>}
  */
 async function hashOtp(otp) {
-  return bcrypt.hash(otp, 8);
+  return hmacOtp(otp);
 }
 
 /**
  * Constant-time compare of OTP against stored hash.
+ * Supports legacy bcrypt hashes still in TTL after deploy.
  * @param {string} otp
  * @param {string} otpHash
  * @returns {Promise<boolean>}
  */
 async function verifyOtpHash(otp, otpHash) {
-  return bcrypt.compare(otp, otpHash);
+  const stored = String(otpHash || '');
+  if (stored.startsWith('$2')) {
+    return bcrypt.compare(otp, stored);
+  }
+
+  const expected = hmacOtp(otp);
+  const a = Buffer.from(expected, 'utf8');
+  const b = Buffer.from(stored, 'utf8');
+  if (a.length !== b.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(a, b);
 }
 
 /**
