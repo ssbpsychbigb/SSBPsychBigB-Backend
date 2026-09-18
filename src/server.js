@@ -15,10 +15,15 @@ async function bootstrap() {
 
   const app = createApp();
 
+<<<<<<< Updated upstream
   server = app.listen(config.port, () => {
+=======
+  server.listen(config.port, '0.0.0.0', () => {
+>>>>>>> Stashed changes
     logger.info('API server started', {
       env: config.env,
       port: config.port,
+      bind: '0.0.0.0',
       apiPrefix: config.apiPrefix,
     });
   });
