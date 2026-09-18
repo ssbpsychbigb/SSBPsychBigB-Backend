@@ -107,8 +107,35 @@ function requireAppUser(options = {}) {
   };
 }
 
+/**
+ * Attaches `req.auth` when a valid app Bearer token is present.
+ * Invalid / missing tokens do not fail the request (guest-friendly reads).
+ *
+ * @type {import('express').RequestHandler}
+ */
+function optionalAppAuth(req, _res, next) {
+  const header = req.headers.authorization || '';
+  const [scheme, token] = header.split(' ');
+
+  if (scheme !== 'Bearer' || !token) {
+    return next();
+  }
+
+  try {
+    const payload = verifyAccessToken(token);
+    if (!payload.portal || payload.portal === PORTAL.APP) {
+      req.auth = payload;
+    }
+  } catch {
+    // * Guest read continues without auth.
+  }
+
+  return next();
+}
+
 module.exports = {
   requireAppAuth,
   requireAppUser,
+  optionalAppAuth,
   APP_ROLES,
 };

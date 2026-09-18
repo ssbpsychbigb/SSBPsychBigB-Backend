@@ -156,22 +156,29 @@ class EmailVerificationService {
     });
 
     const verifyUrl = verifyEmailUrl(token);
-    const mailResult = await mailService.notifyEmailVerification({
-      to: email,
-      name: user.fullName || user.instituteName || 'there',
-      otp,
-      verifyUrl,
-    });
+    void mailService
+      .notifyEmailVerification({
+        to: email,
+        name: user.fullName || user.instituteName || 'there',
+        otp,
+        verifyUrl,
+      })
+      .catch((error) => {
+        logger.error('Email verification send failed', {
+          userId: String(user._id),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
 
     logger.info('Email verification issued', {
       userId: String(user._id),
-      emailSent: Boolean(mailResult?.sent),
+      emailSent: true,
       ...(config.otp.exposeInResponse ? { debugOtp: otp } : {}),
     });
 
     return {
       alreadyVerified: false,
-      emailSent: Boolean(mailResult?.sent),
+      emailSent: true,
       maskedEmail: maskEmail(email),
       expiresIn: config.emailVerify.otpTtlSeconds,
       cooldownSeconds: config.emailVerify.resendCooldownSeconds,

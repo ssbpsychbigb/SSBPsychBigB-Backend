@@ -4,16 +4,33 @@ const config = require('./config');
 const { createApp } = require('./app');
 const { connectDatabase, disconnectDatabase } = require('./config/database');
 const { logger } = require('./common/utils/logger');
+const { attachChatSocket } = require('./modules/chat/chat.socket');
+const { startDayBriefPurgeJob } = require('./modules/day-brief/day-brief.jobs');
+const {
+  startScheduledBroadcastJob,
+} = require('./modules/admin-notifications/admin-notifications.jobs');
+
+const http = require('http');
 
 let server;
+/** @type {import('socket.io').Server | null} */
+let chatIo = null;
+/** @type {(() => void) | null} */
+let stopDayBriefPurge = null;
+/** @type {(() => void) | null} */
+let stopScheduledBroadcasts = null;
 
 /**
- * Boots database + HTTP server and registers graceful shutdown hooks.
+ * Boots database + HTTP server + Socket.IO and registers graceful shutdown hooks.
  */
 async function bootstrap() {
   await connectDatabase();
 
   const app = createApp();
+  server = http.createServer(app);
+  chatIo = attachChatSocket(server);
+  stopDayBriefPurge = startDayBriefPurgeJob();
+  stopScheduledBroadcasts = startScheduledBroadcastJob();
 
 <<<<<<< Updated upstream
   server = app.listen(config.port, () => {
@@ -25,6 +42,7 @@ async function bootstrap() {
       port: config.port,
       bind: '0.0.0.0',
       apiPrefix: config.apiPrefix,
+      realtime: Boolean(chatIo),
     });
   });
 }
@@ -44,6 +62,22 @@ async function shutdown(signal) {
   forceExitTimer.unref();
 
   try {
+    if (stopDayBriefPurge) {
+      stopDayBriefPurge();
+      stopDayBriefPurge = null;
+    }
+    if (stopScheduledBroadcasts) {
+      stopScheduledBroadcasts();
+      stopScheduledBroadcasts = null;
+    }
+
+    if (chatIo) {
+      await new Promise((resolve) => {
+        chatIo.close(() => resolve());
+      });
+      chatIo = null;
+    }
+
     if (server) {
       await new Promise((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
